@@ -82,13 +82,54 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 
 ## 7. External Contracts
 
-```
-USDT = 0x...
-sUSDD = 0x...
-sUSDD_SWAP = 0x...
-MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
-MARKET_ID = 0x...
-```
+| Name | Address |
+| --- | --- |
+| **USDT** | `0xdac17f958d2ee523a2206206994597c13d831ec7` |
+| **USDD** | `0x4f8e5de400de08b164e7421b3ee387f461becd1a` |
+| **sUSDD** (Savings USDD) | `0xc5d6a7b61d18afa11435a889557b068bb9f29930` |
+| **USDD_SWAP** (PSM) | `0xcE355440c00014A229bbEc030A2B8f8EB45a2897` |
+| **MORPHO** | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` |
+| **MARKET_ID** | `0x29ae8cad946d861464d5e829877245a863a18157c0cde2c3524434dafa34e476` |
+
+
+---
+
+#### 1. Staking & Unstaking (sUSDD)
+
+* **Staking:** USDD  sUSDD
+* [Transaction](https://etherscan.io/tx/0x58bc718ac8dc6125cab202c82e0ccc0ab9392375e9dbdb59d757a33f82789199)
+
+
+* **Unstaking:** sUSDD  USDD
+* [Transaction](https://etherscan.io/tx/0x86638473d343d420c25c8db5bef157aef147c592bd2577924676f1a1234847c8)
+
+
+
+#### 2. Peg Stability Module (PSM)
+
+* **Swap:** USDT  USDD
+* [Transaction](https://etherscan.io/tx/0xe7088c5aa0f1feb72b1a084d5f27b3a8d05c4a2e02a73104ee9b459f3a1442e1)
+
+
+* **Swap:** USDD  USDT
+* [Transaction](https://etherscan.io/tx/0x5093d9c6576042bcdecaceed24cc92012bb7b3494825eb38d2b49328487bb5e5)
+
+
+#### 3. Morpho Blue (sUSDD / USDT Market)
+
+[View Market on Morpho](https://app.morpho.org/ethereum/market/0x29ae8cad946d861464d5e829877245a863a18157c0cde2c3524434dafa34e476/susdd-usdt)
+
+**Supply Collateral (sUSDD) & Borrow USDT**
+
+* **Approve sUSDD** (Permit2): [Transaction](https://etherscan.io/tx/0x4452669330f76d5870977104f462ce02e0d1f037c876fc75b097fd7014b7f26b)
+* **Supply & Borrow** (Multicall): [Transaction](https://etherscan.io/tx/0x1b4d37e728140bc05741c8b8c07625090dceaf22f6f47dacb922b214b513ea9d)
+
+**Repay USDT & Withdraw Collateral (sUSDD)**
+
+* **Approve USDT** (Permit2): [Transaction](https://etherscan.io/tx/0x53653bc8674799f8223b1e712cbed1b5f3073291420cd5fe84d59837c98cbf45)
+* **Repay & Withdraw** (Multicall): [Transaction](https://etherscan.io/tx/0xf13b56fbe3b6a0f16c14f0f414629dc2ae3328f785dfc812ab280e3ba5a3666e)
+
+
 
 ---
 
