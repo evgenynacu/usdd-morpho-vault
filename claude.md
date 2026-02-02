@@ -1,5 +1,23 @@
 # Project Guidelines
 
+## Architecture Decision Records (docs/adr/)
+
+ADRs document architectural decisions with rationale.
+
+### ADR Rules:
+
+1. **One question per ADR** - each ADR answers exactly one architectural question
+2. **Concise** - brief decision + rationale, no lengthy explanations
+3. **No implementation code** - describe approach, not specific code
+
+### ADR Format:
+- Title + Question
+- Decision (brief answer)
+- Rationale (why this approach)
+- References (if applicable)
+
+---
+
 ## Requirements Documents (docs/requirements.md)
 
 Requirements should describe **WHAT** needs to be done, not **HOW** to implement it.

@@ -135,6 +135,4 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 
 ## 8. Open Questions
 
-1. **sUSDD Swap Interface** - need to verify exact interface
-2. **Morpho Market** - existing sUSDD/USDT market or need to create?
-3. **sUSDD Yield Source** - how to get yield rate for keeper monitoring?
+1. **sUSDD Yield Source** - how to get yield rate for keeper monitoring?
