@@ -1,1 +1,22 @@
+# IDE
 .idea
+.vscode
+
+# Dependencies
+node_modules
+
+# Build
+artifacts
+cache
+typechain-types
+dist
+
+# Environment
+.env
+
+# Coverage
+coverage
+coverage.json
+
+# Hardhat
+hardhat-deployer.json

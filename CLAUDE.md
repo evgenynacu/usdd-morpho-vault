@@ -44,3 +44,32 @@ Requirements should describe **WHAT** needs to be done, not **HOW** to implement
 - Configuration parameters
 - Risks
 - Open questions
+
+---
+
+## Bug Fix Process
+
+When a bug is discovered, follow this process:
+
+### 1. Write a Failing Test First
+
+Before fixing the bug, write a test that:
+- Reproduces the bug scenario
+- Contains assertions that will **fail** with the current (buggy) code
+- Clearly documents what the expected behavior should be
+
+### 2. Verify the Test Fails
+
+Run the test to confirm it fails. This proves the bug is real and reproducible.
+
+### 3. Fix the Bug
+
+Implement the fix in the code.
+
+### 4. Verify the Test Passes
+
+Run the test again to confirm the fix works and no regressions occurred.
+
+### 5. Update Documentation
+
+If the bug revealed a gap in documentation, update relevant ADRs or requirements.

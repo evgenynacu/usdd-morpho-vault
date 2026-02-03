@@ -38,8 +38,64 @@ OpenZeppelin ERC4626 handles this via `Math.Rounding.Floor` / `Math.Rounding.Cei
 
 ```
 totalAssets = idle USDT
-            + (sUSDD collateral * sUSDD rate)  // via convertToAssets()
+            + (sUSDD collateral * sUSDD rate * PSM adjustment)
             - USDT debt
 ```
 
-All values in USDT terms. The sUSDD rate comes from the sUSDD ERC4626 contract (see ADR-002).
+All values in USDT terms.
+
+### Component Breakdown
+
+**1. Idle USDT:**
+```solidity
+idleUsdt = IERC20(USDT).balanceOf(address(this))
+```
+
+**2. Collateral Value:**
+```solidity
+// sUSDD → USDD via ERC4626 rate
+usddValue = sUSDD.convertToAssets(collateral)
+
+// USDD → USDT accounting for PSM tout fee
+usdtValue = usddValue * WAD / (WAD + tout)
+```
+
+**3. Debt (from Morpho borrowShares):**
+
+Morpho uses share-based accounting for borrows. Converting shares to assets:
+
+```solidity
+// Get position
+Position memory pos = morpho.position(marketId, address(this))
+// pos.borrowShares = our share of total borrow
+
+// Get market state
+Market memory mkt = morpho.market(marketId)
+// mkt.totalBorrowAssets = total USDT borrowed in market
+// mkt.totalBorrowShares = total shares for all borrowers
+
+// Convert our shares to assets
+debt = pos.borrowShares * mkt.totalBorrowAssets / mkt.totalBorrowShares
+```
+
+This conversion is necessary because:
+- Borrow shares represent proportional claim on debt
+- Total borrow assets grow over time with interest
+- Our debt = our proportion × total debt
+
+### Final NAV
+
+```solidity
+if (collateralUsdt + idleUsdt > debtUsdt) {
+    return idleUsdt + collateralUsdt - debtUsdt;
+}
+return 0; // Underwater protection
+```
+
+## Edge Cases
+
+| Case | Handling |
+|------|----------|
+| First deposit (totalSupply = 0) | OpenZeppelin uses 1:1 ratio |
+| Zero NAV | Returns 0, withdrawal reverts with `ZeroNAV` |
+| Underwater position | totalAssets returns 0, protects against negative values |
