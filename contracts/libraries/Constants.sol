@@ -25,6 +25,14 @@ library Constants {
     /// @notice WAD = 1e18, used for fixed-point math
     uint256 internal constant WAD = 1e18;
 
+    /// @notice Basis points denominator (100% = 10000 bps)
+    uint256 internal constant BPS_DENOMINATOR = 10000;
+
+    /// @notice Buffer for delever collateral withdrawal (basis points)
+    /// @dev Covers sUSDD rate accrual between blocks and rounding errors
+    ///      Real slippage is < 1 bps; 10 bps provides ~100x safety margin
+    uint256 internal constant DELEVER_BUFFER_BPS = 10; // 0.1%
+
     /// @notice USDT decimals
     uint8 internal constant USDT_DECIMALS = 6;
 

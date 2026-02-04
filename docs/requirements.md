@@ -5,15 +5,18 @@
 ### 1.1 Purpose
 Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Morpho Blue protocol.
 
-### 1.2 High-Level Flow
+### 1.2 High-Level Flow (when targetLTV > 0)
 1. Users deposit **USDT** (base asset) and receive vault shares
 2. Vault creates leveraged sUSDD position in **Morpho Blue** (sUSDD collateral, USDT debt)
 3. Vault earns amplified sUSDD yield minus borrowing costs
 
+> **Note:** When `targetLTV = 0`, deposits stay as idle USDT without leverage. See section 4.1.1.
+
 ### 1.3 Key Properties
 - **No AMM slippage** on sUSDD/USDT conversion (uses PSM + ERC4626)
-- **ERC4626 compatible** - standard vault interface (base asset: USDT)
-- **Atomic operations** - deposits/withdrawals in single transaction via flash loans
+- **Limited ERC4626** - only `deposit()` and `redeem()` supported (see ADR-005)
+- **Atomic operations** - deposits/withdrawals via flash loans (when `targetLTV > 0`)
+- **PSM fees assumed 0** - see "PSM Fee Assumption" section below
 
 ---
 
@@ -29,25 +32,34 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 
 | Role | Operations |
 |------|------------|
-| **User** | deposit, withdraw, mint, redeem |
+| **User** | deposit, redeem (see ADR-005: mint/withdraw not supported) |
 | **Keeper** | rebalance (lever/delever) |
 | **Manager** | update fees, set fee recipient, set max TVL, harvest fees |
 | **Pauser** | pause/unpause |
-| **Admin** | grant/revoke roles, emergency withdraw |
+| **Admin** | grant/revoke roles, pause (for emergency: rebalance(0) THEN pause) |
 
 ---
 
 ## 4. Strategy Requirements
 
 ### 4.1 Leverage Mechanism
-- Each deposit builds a leveraged position at the current `targetLTV`
-- Withdrawals unwind the position proportionally to the withdrawal amount
-- Idle USDT is used first before unwinding Morpho position
+- When `targetLTV > 0`: each deposit builds a leveraged position via flash loan
+- When `targetLTV = 0`: deposits stay as idle USDT (see section 4.1.1)
+- **Deposit shares**: calculated using **Delta NAV** — shares represent actual value added after PSM fees (protects existing holders from dilution)
+- **Withdrawals**: use **proportional** approach — both idle USDT and position are withdrawn in the same ratio (fairness-first design)
 
 **Example (75% LTV = ~4x leverage):**
 - User deposits 1000 USDT
 - Final position: ~4000 USDT worth of sUSDD collateral, ~3000 USDT debt
 - Net equity: 1000 USDT
+
+### 4.1.1 No-Leverage Mode (targetLTV = 0)
+
+When `targetLTV = 0`:
+- Deposits stay as **idle USDT** (no position built, no flash loan)
+- **No sUSDD yield** is earned — deposits remain in USDT
+- Useful for emergency pause of leverage without pausing user deposits
+- Re-levering via `rebalance(newLTV)` deploys all idle USDT into a new position
 
 ### 4.2 Rebalancing
 - Keeper monitors LTV and adjusts position via `rebalance(targetLTV)`
@@ -85,7 +97,23 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 | `MaxTotalAssetsExceeded` | Deposit would exceed TVL cap |
 | `InsufficientWithdrawBalance` | Cannot fulfill withdrawal amount |
 | `ZeroNAV` | NAV is zero (underwater position) |
+| `DepositTooSmall` | Deposit rounds to 0 shares (dust rejected) |
 | `UnauthorizedCallback` | Flash loan callback from non-Morpho |
+
+### Underwater Position (NAV = 0)
+
+When collateral value ≤ debt, the vault is "underwater" and `totalAssets()` returns 0.
+
+| Operation | Behavior |
+|-----------|----------|
+| `maxDeposit()` | Returns 0 |
+| `previewDeposit()` | Returns 0 |
+| `convertToShares()` | Returns 0 |
+| `deposit()` | Reverts `ZeroNAV` |
+| `redeem()` | Reverts `ZeroNAV` |
+| `rebalance(0)` | No-op (exits early) |
+
+**Recovery:** Wait for Morpho liquidation or inject external capital.
 
 ---
 
@@ -99,7 +127,71 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 | Liquidation | Conservative LTV, rebalance buffer, LLTV validation |
 | Keeper failure | Multiple keepers via AccessControl |
 | Morpho liquidity | Monitor utilization off-chain |
-| PSM fee changes | Code handles non-zero tin/tout defensively |
+| PSM fee changes | See "PSM Fee Assumption" below |
+
+### PSM Fee Assumption
+
+> **Design Decision:** The vault assumes PSM tin/tout fees are **0** (current mainnet state).
+
+This assumption is used in:
+- `SwapHelper.sol` — all swap and preview functions
+- `SUSDDVault.sol` — NAV calculation, deposit/withdraw logic
+
+**Why we made this choice:**
+
+| Factor | Consideration |
+|--------|---------------|
+| Current state | PSM tin/tout = 0 on mainnet |
+| Probability of change | Very low (USDD governance decision) |
+| Code complexity | Handling fees adds ~30% more code |
+| Gas cost | Fee calculations in every operation |
+
+**What happens if PSM enables fees:**
+
+| Operation | Behavior | Risk |
+|-----------|----------|------|
+| Deposit | May work (overpays slightly) | Low |
+| Withdraw | Reverts (insufficient USDT) | None (fail-safe) |
+| Delever | Reverts (insufficient USDT) | None (fail-safe) |
+| Funds | Safe in Morpho | None |
+
+**Resolution path:** Deploy upgraded contract with fee handling, migrate users.
+
+**How reverts happen:** The vault code assumes 1:1 swap rates. If PSM enables fees:
+- `buyGem(gemAmt)` expects to receive `gemAmt` USDT
+- With fees, PSM sends less than `gemAmt`
+- Subsequent operations fail due to insufficient balance
+
+The vault does NOT explicitly check tin/tout values — reverts are a consequence of incorrect assumptions, not explicit guards. This is acceptable because:
+1. Reverts are fail-safe (no fund loss)
+2. Adding explicit checks would increase code complexity for a low-probability scenario
+
+### Implementation Notes
+
+**USDD Dust from Decimal Conversion**
+
+When converting sUSDD → USDT, the 18→6 decimal division (`usddReceived / 1e12`) truncates up to 0.000001 USDD per swap. This dust:
+- Stays in the vault as USDD balance
+- Is NOT included in `totalAssets()` (which only counts USDT, sUSDD collateral, debt)
+- Accumulates over time but is negligible (< 1 USDD per million swaps)
+- No sweep mechanism implemented (gas cost exceeds value)
+
+**TVL Limit Check**
+
+`maxTotalAssets` is checked conservatively BEFORE position is built:
+```solidity
+if (assets + totalAssets() > maxTotalAssets) revert MaxTotalAssetsExceeded();
+```
+This means the actual NAV after deposit may be slightly different due to sUSDD rate. The check is intentionally conservative to ensure the limit is never exceeded.
+
+**Preview Functions**
+
+`previewDeposit()` and `convertToShares()` return estimates based on current state. They do NOT check:
+- Paused state
+- `maxTotalAssets` limit
+- Whether deposit would result in `DepositTooSmall`
+
+This is standard ERC4626 behavior. Integrators should check `maxDeposit()` to determine if deposits are actually allowed.
 
 ---
 

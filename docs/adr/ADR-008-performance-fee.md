@@ -1,4 +1,4 @@
-# ADR-005: Performance Fee
+# ADR-008: Performance Fee
 
 ## Question
 How do we accrue and calculate performance fees?

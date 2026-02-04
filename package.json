@@ -5,18 +5,20 @@
   "scripts": {
     "compile": "hardhat compile",
     "test": "hardhat test",
-    "test:fork": "hardhat test --network hardhat",
-    "test:interfaces": "hardhat test test/Interfaces.test.ts",
-    "test:swap": "hardhat test test/SwapHelper.test.ts",
-    "test:vault": "hardhat test test/SUSDDVault.test.ts",
-    "test:deploy": "hardhat test test/Deploy.test.ts",
+    "test:unit": "hardhat test test/unit/SUSDDVault.unit.test.ts",
+    "test:fork": "hardhat test test/fork/SUSDDVault.fork.test.ts test/fork/SwapHelper.fork.test.ts test/fork/Interfaces.fork.test.ts",
     "deploy": "hardhat run scripts/deploy.ts",
     "deploy:mainnet": "hardhat run scripts/deploy.ts --network mainnet",
     "configure": "hardhat run scripts/configure.ts",
     "clean": "hardhat clean",
     "typechain": "hardhat compile"
   },
-  "keywords": ["defi", "vault", "erc4626", "morpho"],
+  "keywords": [
+    "defi",
+    "vault",
+    "erc4626",
+    "morpho"
+  ],
   "author": "",
   "license": "ISC",
   "devDependencies": {
@@ -31,5 +33,8 @@
     "ts-node": "^10.9.2",
     "typechain": "^8.3.2",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@morpho-org/morpho-blue": "^1.0.0"
   }
 }

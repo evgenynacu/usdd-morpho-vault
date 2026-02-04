@@ -6,6 +6,8 @@ Should we use standard ERC4626 or a custom vault interface?
 ## Decision
 **Standard ERC4626** with USDT as the base asset.
 
+> **Note:** The interface is limited to `deposit()` and `redeem()` only. See [ADR-005](ADR-005-limited-erc4626.md) for rationale.
+
 ## Rationale
 
 1. **Simpler architecture** - Single strategy with atomic operations, no need for complex parent/child or queued epochs.

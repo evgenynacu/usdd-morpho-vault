@@ -73,3 +73,62 @@ Run the test again to confirm the fix works and no regressions occurred.
 ### 5. Update Documentation
 
 If the bug revealed a gap in documentation, update relevant ADRs or requirements.
+
+---
+
+## Testing Strategy
+
+### Principle: Unit Tests First, Fork Tests for Integration
+
+**80% unit tests (mocks) / 20% fork tests**
+
+### Unit Tests (with mocks)
+
+Fast, stable, run always. Cover:
+- Access control (roles, permissions)
+- Pausable behavior
+- Parameter validation (LTV limits, fee limits)
+- NAV calculation logic
+- Fee calculation
+- Flash loan callback flow
+- Error conditions and reverts
+
+Mocks needed:
+- `MockMorpho` - stateful, tracks positions, executes flash loan callbacks
+- `MockPSM` - simulates sellGem/buyGem with configurable tin/tout
+- `MockSUSDD` - ERC4626 mock with configurable exchange rate
+- `MockERC20` - for USDT/USDD tokens
+
+### Fork Tests (mainnet fork)
+
+Slower, require RPC, can be flaky. Use for:
+- PSM swap math verification (real tin/tout, decimals)
+- Interest accrual (MorphoBalancesLib)
+- E2E scenarios (full deposit → rebalance → withdraw)
+- Interface compatibility with mainnet contracts
+- Gas estimation
+
+**Always use fixed `blockNumber`** for stability.
+
+### Why This Split?
+
+Fork test problems for this project:
+1. **Flakiness** - sUSDD rate, Morpho state, PSM fees change constantly
+2. **Infrastructure dependency** - RPC can be rate-limited or unavailable
+3. **Speed** - RPC latency adds up
+4. **Debugging difficulty** - hard to tell if failure is bug or mainnet state change
+
+### Test File Structure
+
+```
+test/
+├── unit/
+│   ├── SUSDDVault.unit.test.ts
+│   └── mocks/
+│       ├── MockMorpho.sol
+│       ├── MockPSM.sol
+│       └── MockSUSDD.sol
+└── fork/
+    ├── SUSDDVault.fork.test.ts
+    └── SwapHelper.fork.test.ts
+```

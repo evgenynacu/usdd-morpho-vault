@@ -67,7 +67,7 @@ targetDebt = NAV * newTargetLTV / (1 - newTargetLTV);
 3. `rebalance(0.6e18)` → All 1000 USDT deployed into new position at 60% LTV
 
 **When idle USDT exists (targetLTV > 0):**
-- Partial delever buffer (~1%) creates small idle amounts
+- Partial delever buffer (0.1% / 10 bps) creates small idle amounts
 - Next lever up automatically deploys this idle
 - No manual intervention needed
 

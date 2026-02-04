@@ -18,8 +18,10 @@ The vault uses three operation types in flash loan callbacks:
 
 ## Flow: Deposit (Build Leverage)
 
+> **Note:** Flash loan is only used when `targetLTV > 0` and `borrowAmount > 0`. When `targetLTV = 0`, deposits stay as idle USDT without flash loan.
+
 ```
-User deposits USDT
+User deposits USDT (when targetLTV > 0)
     │
     ▼
 ┌─────────────────────────────────────────────┐
@@ -48,16 +50,19 @@ Result: Leveraged sUSDD position
 ## Flow: Withdraw (Unwind Leverage)
 
 ```
-User requests withdrawal
+User requests withdrawal (X USDT)
     │
     ▼
-Check idle USDT balance
+Calculate withdrawal ratio = X / NAV
     │
-    ├── Sufficient idle USDT? → Transfer directly, done
+    ▼
+┌─────────────────────────────────────────────┐
+│ Proportionally withdraw:                    │
+│   - idleToWithdraw = idle * ratio           │
+│   - positionToUnwind = position * ratio     │
+└─────────────────────────────────────────────┘
     │
-    └── Need to unwind position:
-        │
-        ▼
+    ▼ (if positionToUnwind > 0)
 ┌─────────────────────────────────────────────┐
 │ Flash loan USDT from Morpho (OP_WITHDRAW)   │
 │   │                                         │
@@ -75,10 +80,10 @@ Check idle USDT balance
 └─────────────────────────────────────────────┘
     │
     ▼
-Transfer USDT to user
+Transfer USDT to user (idleToWithdraw + unwind proceeds)
 ```
 
-**Idle USDT Optimization:** If the vault holds idle USDT (e.g., from previous operations), withdrawals first use idle balance before unwinding the Morpho position. This saves gas and preserves the leveraged position when possible.
+**Proportional Fairness:** Both idle USDT and position are withdrawn in the same ratio. This ensures all users pay similar gas/fees regardless of withdrawal order. See "Proportional Withdrawal" section below for details.
 
 ## Flow: Rebalance (Lever Up)
 
@@ -127,6 +132,36 @@ Keeper calls rebalance(lowerLTV)
 └─────────────────────────────────────────────┘
 ```
 
+## Flash Loan Mechanics
+
+### Morpho Flash Loan Flow
+
+```solidity
+// Morpho.sol
+function flashLoan(address token, uint256 assets, bytes calldata data) external {
+    IERC20(token).safeTransfer(msg.sender, assets);           // 1. Send tokens
+    IMorphoFlashLoanCallback(msg.sender).onMorphoFlashLoan(assets, data);  // 2. Callback
+    IERC20(token).safeTransferFrom(msg.sender, address(this), assets);     // 3. Pull back
+}
+```
+
+**Key point:** Morpho uses `safeTransferFrom` to reclaim tokens, which **requires approval**.
+
+### Approval Strategy
+
+The vault sets infinite approval in constructor:
+
+```solidity
+constructor(...) {
+    IERC20(Constants.USDT).forceApprove(Constants.MORPHO, type(uint256).max);
+    IERC20(Constants.SUSDD).forceApprove(Constants.MORPHO, type(uint256).max);
+}
+```
+
+**Important:** Do NOT call `forceApprove` in callbacks — it would overwrite infinite approval with a smaller amount, causing subsequent operations to fail.
+
+---
+
 ## Rationale
 
 1. **No intermediate state** - Position never exists in partial/risky state.
@@ -154,13 +189,89 @@ borrowAmount = depositedUsdt * targetLTV / (1 - targetLTV)
 
 **Withdrawal proportional amounts:**
 ```
-usdtNeededFromPosition = usdtToWithdraw - idleUsdt
-positionValue = NAV - idleUsdt  // Value locked in Morpho position
-collateralToWithdraw = totalCollateral * usdtNeededFromPosition / positionValue
-debtToRepay = totalDebt * usdtNeededFromPosition / positionValue
+withdrawRatio = usdtToWithdraw / NAV
+
+// Proportional from idle
+idleToWithdraw = idleUsdt * withdrawRatio
+
+// Proportional from position
+collateralToWithdraw = totalCollateral * withdrawRatio
+debtToRepay = totalDebt * withdrawRatio
 ```
 
-Note: We use `positionValue` (not NAV) as the denominator because we're calculating proportions relative to the Morpho position only, not including idle USDT.
+Note: We use NAV as the denominator because we're withdrawing proportionally from ALL assets (both idle and position). This ensures fairness across all users.
+
+## Withdraw Algorithm Details
+
+### Full Withdraw Detection
+
+Full position unwind happens only when ALL vault shares are burned:
+
+```solidity
+bool isFullWithdraw = (totalSupply() == 0);
+```
+
+This ensures:
+- **Dust-free exit** for the last user — no micro-debt or collateral remains
+- **Predictable behavior** — no magic percentage thresholds
+- **Fairness** — other users' positions unaffected by large withdrawals
+
+Previously used 99% threshold, but that caused unexpected full unwinds on large partial withdrawals.
+
+### Debt Repayment Strategy
+
+| Scenario | Method | Reason |
+|----------|--------|--------|
+| Full withdraw | `repay(0, borrowShares)` | Exact clearance, no dust |
+| Partial withdraw | `repay(assets, 0)` | Proportional reduction |
+
+**Why this matters:** Morpho rounds UP when converting assets→shares for repay. This can leave micro-debt on partial withdrawals. Full withdraw avoids this by specifying exact shares to burn.
+
+```solidity
+// Full withdraw — repay by shares (exact)
+if (isFullWithdraw && pos.borrowShares > 0) {
+    morpho.repay(marketParams, 0, pos.borrowShares, address(this), "");
+}
+
+// Partial withdraw — repay by assets
+morpho.repay(marketParams, repayAmount, 0, address(this), "");
+```
+
+### Proportional Withdrawal (Fairness First)
+
+The vault uses **proportional withdrawal** — both idle USDT and position are withdrawn in the same ratio:
+
+```
+withdraw(300 USDT) when NAV=1000, idle=100, position=900:
+├── ratio = 300/1000 = 30%
+├── idle: 100 * 30% = 30 USDT
+└── position: 900 * 30% = 270 USDT (unwind)
+```
+
+**Why proportional?**
+
+| Approach | Early Withdrawer | Late Withdrawer |
+|----------|-----------------|-----------------|
+| Idle-first | Cheap (just transfer) | Expensive (full unwind) |
+| **Proportional** | **Same cost** | **Same cost** |
+
+**Trade-off accepted:** Every withdrawal touches the Morpho position (more gas), but this ensures fairness — all users pay similar costs regardless of withdrawal order.
+
+**Example: Bank run scenario**
+```
+Vault: idle=500, position=500, NAV=1000
+
+With idle-first:
+├── User A (50%) withdraws first → gets 500 from idle (cheap)
+└── User B (50%) withdraws second → must unwind entire position (expensive)
+
+With proportional:
+├── User A (50%) → 250 idle + 250 from position
+└── User B (50%) → 250 idle + 250 from position
+Both pay the same! ✓
+```
+
+---
 
 ## Delever Algorithm Details
 
@@ -171,7 +282,7 @@ When reducing leverage but not fully exiting:
 1. Flash loan the amount of debt to repay
 2. Repay that debt to Morpho
 3. Calculate collateral needed: `previewSUSDDNeededForUSDT(flashLoanAmount)`
-4. Add 1% buffer for slippage/rounding: `collateral *= 101 / 100`
+4. Add 0.1% buffer for rounding: `collateral *= 10010 / 10000` (see `DELEVER_BUFFER_BPS`)
 5. Withdraw and convert collateral to repay flash loan
 
 This may leave small amounts of excess USDT as idle balance.
@@ -187,3 +298,30 @@ When fully exiting the leveraged position:
 5. Repay flash loan, remainder becomes idle USDT
 
 The key difference: partial delever withdraws only what's needed for the flash loan, while full delever withdraws everything.
+
+### Edge Case: Underwater Position
+
+If `totalAssets() == 0` (underwater: collateral value ≤ debt), `rebalance()` exits early:
+
+```solidity
+uint256 nav = totalAssets();
+if (nav == 0) return;  // Cannot rebalance underwater position
+```
+
+**Why this is correct:**
+
+| Scenario | Collateral | Debt | NAV | Can Delever? |
+|----------|------------|------|-----|--------------|
+| Healthy | 4000 USDT | 3000 USDT | 1000 USDT | ✅ Yes |
+| Underwater | 2900 USDT | 3000 USDT | 0 | ❌ No |
+
+Delevering requires: sell collateral → get USDT → repay debt.
+If collateral < debt, there's not enough USDT to repay — delevering is impossible without external capital.
+
+**What to do with underwater positions:**
+
+1. **Wait for liquidation** — Morpho will liquidate when position crosses LLTV
+2. **Capital injection** — Add USDT externally, then delever
+3. **Accept the loss** — Users redeem what's available
+
+This is not a bug — it's the correct behavior for an insolvent position.

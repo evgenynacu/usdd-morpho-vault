@@ -174,6 +174,24 @@ interface IMorpho {
     /// @param authorized The authorized address.
     /// @return True if authorized, false otherwise.
     function isAuthorized(address authorizer, address authorized) external view returns (bool);
+
+    /// @notice Returns the borrow shares of `user` in the given market.
+    /// @param id The market id.
+    /// @param user The user address.
+    /// @return The borrow shares of `user`.
+    function borrowShares(Id id, address user) external view returns (uint256);
+
+    /// @notice Returns the supply shares of `user` in the given market.
+    /// @param id The market id.
+    /// @param user The user address.
+    /// @return The supply shares of `user`.
+    function supplyShares(Id id, address user) external view returns (uint256);
+
+    /// @notice Returns the collateral of `user` in the given market.
+    /// @param id The market id.
+    /// @param user The user address.
+    /// @return The collateral of `user`.
+    function collateral(Id id, address user) external view returns (uint256);
 }
 
 /// @title IMorphoFlashLoanCallback
