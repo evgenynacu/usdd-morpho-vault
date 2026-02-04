@@ -60,8 +60,16 @@ contract SUSDDVault is
     /// @notice Cached Morpho market params
     MarketParams public marketParams;
 
+    // ============ Whitelist ============
+
+    /// @notice If true, only whitelisted addresses can deposit/redeem
+    bool public whitelistEnabled;
+
+    /// @notice Addresses allowed when whitelist is enabled
+    mapping(address => bool) public whitelisted;
+
     /// @notice Storage gap for future upgrades
-    uint256[50] private __gap;
+    uint256[48] private __gap;
 
     // ============ Constants ============
 
@@ -89,6 +97,9 @@ contract SUSDDVault is
     event MaxTotalAssetsUpdated(uint256 oldMax, uint256 newMax);
     event Rebalanced(uint256 oldLTV, uint256 newLTV, uint256 collateralBefore, uint256 debtBefore);
     event PerformanceFeeAccrued(uint256 feeShares, address indexed recipient);
+    event WhitelistEnabledUpdated(bool enabled);
+    event AddedToWhitelist(address indexed account);
+    event RemovedFromWhitelist(address indexed account);
 
     /// @notice Vault state snapshot for Dune dashboard tracking
     /// @dev Emitted after deposit, redeem, rebalance, harvestFees
@@ -105,6 +116,8 @@ contract SUSDDVault is
     error UnauthorizedCallback();
     error ZeroNAV();
     error DepositTooSmall();
+    error NotWhitelisted(address account);
+    error InvalidAdmin();
 
     // ============ Constructor & Initializer ============
 
@@ -127,6 +140,7 @@ contract SUSDDVault is
         uint256 _maxTotalAssets
     ) external initializer {
         // Validate before init
+        if (_admin == address(0)) revert InvalidAdmin();
         if (_performanceFeeBps > MAX_PERFORMANCE_FEE_BPS) revert InvalidFee();
         if (_feeRecipient == address(0)) revert InvalidRecipient();
 
@@ -160,6 +174,7 @@ contract SUSDDVault is
         feeRecipient = _feeRecipient;
         maxTotalAssets = _maxTotalAssets;
         highWaterMark = 1e18; // Start at 1:1
+        whitelistEnabled = true; // Whitelist active by default
 
         // Authorize Morpho to pull tokens
         IERC20(Constants.USDT).forceApprove(Constants.MORPHO, type(uint256).max);
@@ -193,9 +208,12 @@ contract SUSDDVault is
     }
 
     /// @notice Maximum deposit amount
-    /// @dev Returns 0 if paused, TVL cap reached, or underwater (NAV=0 with existing shares)
-    function maxDeposit(address) public view override returns (uint256) {
+    /// @dev Returns 0 if paused, TVL cap reached, underwater, or receiver not whitelisted
+    function maxDeposit(address receiver) public view override returns (uint256) {
         if (paused()) return 0;
+
+        // Whitelist check: if enabled, receiver must be whitelisted
+        if (whitelistEnabled && !whitelisted[receiver]) return 0;
 
         uint256 currentAssets = totalAssets();
 
@@ -214,6 +232,13 @@ contract SUSDDVault is
     /// @notice Maximum withdraw amount (returns 0 - withdraw not supported)
     function maxWithdraw(address) public pure override returns (uint256) {
         return 0;
+    }
+
+    /// @notice Maximum redeem amount
+    /// @dev Returns 0 if owner not whitelisted (when whitelist enabled)
+    function maxRedeem(address owner) public view override returns (uint256) {
+        if (whitelistEnabled && !whitelisted[owner]) return 0;
+        return balanceOf(owner);
     }
 
     /// @notice Preview shares for deposit (Delta NAV approach)
@@ -289,6 +314,12 @@ contract SUSDDVault is
         // Block deposits if vault is underwater (NAV=0 but shares exist)
         // This prevents dilution of existing holders
         if (supplyBefore > 0 && navBefore == 0) revert ZeroNAV();
+
+        // Check whitelist (both caller and receiver must be whitelisted)
+        if (whitelistEnabled) {
+            if (!whitelisted[caller]) revert NotWhitelisted(caller);
+            if (!whitelisted[receiver]) revert NotWhitelisted(receiver);
+        }
 
         // 2. Transfer USDT from caller
         SafeERC20.safeTransferFrom(IERC20(Constants.USDT), caller, address(this), assets);
@@ -419,6 +450,12 @@ contract SUSDDVault is
         address caller = _msgSender();
         if (caller != owner) {
             _spendAllowance(owner, caller, shares);
+        }
+
+        // Check whitelist (both owner and receiver must be whitelisted)
+        if (whitelistEnabled) {
+            if (!whitelisted[owner]) revert NotWhitelisted(owner);
+            if (!whitelisted[receiver]) revert NotWhitelisted(receiver);
         }
 
         // Calculate withdrawal ratio BEFORE burning (shares-based, no NAV needed)
@@ -715,6 +752,32 @@ contract SUSDDVault is
         uint256 oldMax = maxTotalAssets;
         maxTotalAssets = newMax;
         emit MaxTotalAssetsUpdated(oldMax, newMax);
+    }
+
+    /// @notice Enable or disable whitelist mode
+    function setWhitelistEnabled(bool enabled) external onlyRole(MANAGER_ROLE) {
+        whitelistEnabled = enabled;
+        emit WhitelistEnabledUpdated(enabled);
+    }
+
+    /// @notice Add address to whitelist
+    function addToWhitelist(address account) external onlyRole(MANAGER_ROLE) {
+        whitelisted[account] = true;
+        emit AddedToWhitelist(account);
+    }
+
+    /// @notice Remove address from whitelist
+    function removeFromWhitelist(address account) external onlyRole(MANAGER_ROLE) {
+        whitelisted[account] = false;
+        emit RemovedFromWhitelist(account);
+    }
+
+    /// @notice Batch add addresses to whitelist
+    function addToWhitelistBatch(address[] calldata accounts) external onlyRole(MANAGER_ROLE) {
+        for (uint256 i = 0; i < accounts.length; i++) {
+            whitelisted[accounts[i]] = true;
+            emit AddedToWhitelist(accounts[i]);
+        }
     }
 
     /// @notice Accrue fees + emit heartbeat for tracking

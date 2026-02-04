@@ -34,7 +34,7 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 |------|------------|
 | **User** | deposit, redeem (see ADR-005: mint/withdraw not supported) |
 | **Keeper** | rebalance (lever/delever), harvestFees (emit heartbeat) |
-| **Manager** | update fees, set fee recipient, set max TVL |
+| **Manager** | update fees, set fee recipient, set max TVL, manage whitelist |
 | **Pauser** | pause/unpause |
 | **Admin** | grant/revoke roles, pause (for emergency: rebalance(IDLE_MODE) THEN pause) |
 
@@ -106,6 +106,41 @@ The vault supports three operating modes based on `targetLTV`:
 | `feeRecipient` | Address receiving fees | - | Non-zero |
 | `highWaterMark` | NAV/share threshold | 1e18 | Auto-updated |
 | `IDLE_MODE` | Constant for idle mode | `type(uint256).max` | Immutable constant |
+| `whitelistEnabled` | Restrict deposit/redeem to whitelisted | true (default) | Toggle via Manager |
+| `whitelisted` | Mapping of allowed addresses | - | Managed via Manager |
+
+---
+
+## 5.1 Whitelist
+
+The vault supports optional whitelist mode to restrict deposits and redemptions during testing period.
+
+### Behavior
+
+| State | Deposit | Redeem |
+|-------|---------|--------|
+| `whitelistEnabled = true` | Both caller AND receiver must be whitelisted | Both owner AND receiver must be whitelisted |
+| `whitelistEnabled = false` | Open to everyone | Open to everyone |
+
+### Default State
+
+- `whitelistEnabled = true` by default (whitelist active)
+- Addresses must be added before anyone can deposit/redeem
+
+### Management (MANAGER_ROLE)
+
+| Function | Description |
+|----------|-------------|
+| `setWhitelistEnabled(bool)` | Enable or disable whitelist mode |
+| `addToWhitelist(address)` | Add single address |
+| `removeFromWhitelist(address)` | Remove single address |
+| `addToWhitelistBatch(address[])` | Add multiple addresses |
+
+### Notes
+
+- Share transfers (ERC20) are NOT restricted - non-whitelisted addresses can hold shares but not redeem
+- Fee accrual (`_mint` to feeRecipient) bypasses whitelist
+- After testing period: call `setWhitelistEnabled(false)` to open to everyone
 
 ---
 
@@ -113,6 +148,7 @@ The vault supports three operating modes based on `targetLTV`:
 
 | Error | Trigger |
 |-------|---------|
+| `InvalidAdmin` | admin is zero address in initialize() |
 | `InvalidLTV` | targetLTV > MAX_LTV (90%) |
 | `LTVExceedsLLTV` | targetLTV >= market liquidation threshold |
 | `InvalidFee` | performanceFeeBps > 30% |
@@ -120,6 +156,7 @@ The vault supports three operating modes based on `targetLTV`:
 | `MaxTotalAssetsExceeded` | Deposit would exceed TVL cap |
 | `ZeroNAV` | NAV is zero on deposit (shares exist but NAV=0) |
 | `DepositTooSmall` | Deposit rounds to 0 shares (dust rejected) |
+| `NotWhitelisted` | Address not whitelisted when whitelist enabled |
 | `UnauthorizedCallback` | Flash loan callback from non-Morpho |
 
 ### ZeroNAV vs Underwater
@@ -227,7 +264,7 @@ This assumption is used in:
 
 > **Note:** Preview functions (`previewDeposit`, `convertToShares`) may become inaccurate if PSM fees are enabled, but deposits may still succeed. Integrators should not rely on preview accuracy if PSM fees change.
 
-**Resolution path:** Deploy upgraded contract with fee handling, migrate users.
+**Resolution path:** Upgrade implementation via UUPS proxy (`upgradeTo`) with fee handling logic.
 
 **How reverts happen:** The vault code assumes 1:1 swap rates. If PSM enables fees:
 - `buyGem(gemAmt)` expects to receive `gemAmt` USDT
@@ -240,11 +277,12 @@ The vault does NOT explicitly check tin/tout values — reverts are a consequenc
 
 ### Approval Security
 
-> **Design Decision:** The vault grants unlimited token approval to Morpho Blue in constructor.
+> **Design Decision:** The vault grants unlimited token approval to Morpho Blue in `initialize()`.
 
 ```solidity
-IERC20(USDT).forceApprove(MORPHO, type(uint256).max);
-IERC20(SUSDD).forceApprove(MORPHO, type(uint256).max);
+// In initialize()
+IERC20(Constants.USDT).forceApprove(Constants.MORPHO, type(uint256).max);
+IERC20(Constants.SUSDD).forceApprove(Constants.MORPHO, type(uint256).max);
 ```
 
 **Why this is safe for Morpho Blue:**

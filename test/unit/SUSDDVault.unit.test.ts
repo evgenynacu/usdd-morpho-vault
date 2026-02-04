@@ -230,6 +230,54 @@ describe("SUSDDVault Unit Tests", function () {
         )
       ).to.be.revertedWithCustomError(vault, "InvalidRecipient");
     });
+
+    it("should revert with zero admin", async function () {
+      const VaultFactory = await ethers.getContractFactory("SUSDDVault");
+      await expect(
+        upgrades.deployProxy(
+          VaultFactory,
+          [ethers.ZeroAddress, admin.address, ethers.parseEther("0.75"), 1000, ethers.parseUnits("1000000", 6)],
+          { kind: "uups" }
+        )
+      ).to.be.revertedWithCustomError(vault, "InvalidAdmin");
+    });
+
+    it("should not allow initialize to be called twice", async function () {
+      // vault is already initialized, try to call initialize again
+      await expect(
+        vault.initialize(
+          admin.address,
+          admin.address,
+          ethers.parseEther("0.75"),
+          1000,
+          ethers.parseUnits("1000000", 6)
+        )
+      ).to.be.revertedWithCustomError(vault, "InvalidInitialization");
+    });
+  });
+
+  describe("Upgradeability", function () {
+    it("should allow admin to upgrade", async function () {
+      const VaultFactoryV2 = await ethers.getContractFactory("SUSDDVault");
+
+      // Admin should be able to upgrade
+      await expect(
+        upgrades.upgradeProxy(await vault.getAddress(), VaultFactoryV2)
+      ).to.not.be.reverted;
+    });
+
+    it("should not allow non-admin to upgrade", async function () {
+      const VaultFactoryV2 = await ethers.getContractFactory("SUSDDVault", user1);
+
+      // Get the new implementation address
+      const newImpl = await VaultFactoryV2.deploy();
+      await newImpl.waitForDeployment();
+
+      // user1 should not be able to upgrade
+      await expect(
+        vault.connect(user1).upgradeToAndCall(await newImpl.getAddress(), "0x")
+      ).to.be.reverted;
+    });
   });
 
   describe("Access Control", function () {
@@ -389,6 +437,12 @@ describe("SUSDDVault Unit Tests", function () {
   });
 
   describe("Deposit Flow", function () {
+    beforeEach(async function () {
+      // Whitelist users for deposit tests
+      await vault.connect(manager).addToWhitelist(user1.address);
+      await vault.connect(manager).addToWhitelist(user2.address);
+    });
+
     it("should accept deposit and mint shares", async function () {
       const depositAmount = ethers.parseUnits("1000", 6);
 
@@ -461,7 +515,8 @@ describe("SUSDDVault Unit Tests", function () {
 
   describe("Withdraw Flow", function () {
     beforeEach(async function () {
-      // Setup: deposit some funds first
+      // Setup: whitelist user and deposit some funds first
+      await vault.connect(manager).addToWhitelist(user1.address);
       const depositAmount = ethers.parseUnits("1000", 6);
       await vault.connect(user1).deposit(depositAmount, user1.address);
     });
@@ -522,8 +577,252 @@ describe("SUSDDVault Unit Tests", function () {
     });
   });
 
+  describe("Whitelist", function () {
+    describe("Deposit checks", function () {
+      it("should allow deposit when both caller and receiver whitelisted", async function () {
+        // Add user1 to whitelist
+        await vault.connect(manager).addToWhitelist(user1.address);
+
+        const depositAmount = ethers.parseUnits("1000", 6);
+        await expect(
+          vault.connect(user1).deposit(depositAmount, user1.address)
+        ).to.not.be.reverted;
+
+        expect(await vault.balanceOf(user1.address)).to.be.gt(0);
+      });
+
+      it("should revert deposit when caller not whitelisted", async function () {
+        const depositAmount = ethers.parseUnits("1000", 6);
+
+        // ERC4626 checks maxDeposit first, which returns 0 for non-whitelisted
+        await expect(
+          vault.connect(user1).deposit(depositAmount, user1.address)
+        ).to.be.revertedWithCustomError(vault, "ERC4626ExceededMaxDeposit");
+      });
+
+      it("should revert deposit when receiver not whitelisted", async function () {
+        // Add caller (user1) but not receiver (user2)
+        await vault.connect(manager).addToWhitelist(user1.address);
+
+        const depositAmount = ethers.parseUnits("1000", 6);
+
+        // ERC4626 checks maxDeposit(receiver) first, which returns 0 for non-whitelisted
+        await expect(
+          vault.connect(user1).deposit(depositAmount, user2.address)
+        ).to.be.revertedWithCustomError(vault, "ERC4626ExceededMaxDeposit");
+      });
+    });
+
+    describe("Redeem checks", function () {
+      beforeEach(async function () {
+        // Setup: whitelist user1 and deposit
+        await vault.connect(manager).addToWhitelist(user1.address);
+        const depositAmount = ethers.parseUnits("1000", 6);
+        await vault.connect(user1).deposit(depositAmount, user1.address);
+      });
+
+      it("should allow redeem when both owner and receiver whitelisted", async function () {
+        const shares = await vault.balanceOf(user1.address);
+
+        await expect(
+          vault.connect(user1).redeem(shares, user1.address, user1.address)
+        ).to.not.be.reverted;
+      });
+
+      it("should revert redeem when owner not whitelisted", async function () {
+        // Remove user1 from whitelist after deposit
+        await vault.connect(manager).removeFromWhitelist(user1.address);
+
+        const shares = await vault.balanceOf(user1.address);
+
+        // ERC4626 checks maxRedeem(owner) first, which returns 0 for non-whitelisted
+        await expect(
+          vault.connect(user1).redeem(shares, user1.address, user1.address)
+        ).to.be.revertedWithCustomError(vault, "ERC4626ExceededMaxRedeem");
+      });
+
+      it("should revert redeem when receiver not whitelisted", async function () {
+        // user1 is whitelisted, user2 is not
+        const shares = await vault.balanceOf(user1.address);
+
+        await expect(
+          vault.connect(user1).redeem(shares, user2.address, user1.address)
+        ).to.be.revertedWithCustomError(vault, "NotWhitelisted")
+          .withArgs(user2.address);
+      });
+    });
+
+    describe("Disabled mode", function () {
+      it("should allow any user to deposit when whitelist disabled", async function () {
+        // Disable whitelist
+        await vault.connect(manager).setWhitelistEnabled(false);
+
+        const depositAmount = ethers.parseUnits("1000", 6);
+
+        // user1 is NOT whitelisted, but should be able to deposit
+        await expect(
+          vault.connect(user1).deposit(depositAmount, user1.address)
+        ).to.not.be.reverted;
+
+        expect(await vault.balanceOf(user1.address)).to.be.gt(0);
+      });
+
+      it("should allow any user to redeem when whitelist disabled", async function () {
+        // Setup: deposit with whitelist enabled
+        await vault.connect(manager).addToWhitelist(user1.address);
+        const depositAmount = ethers.parseUnits("1000", 6);
+        await vault.connect(user1).deposit(depositAmount, user1.address);
+
+        // Remove from whitelist and disable whitelist
+        await vault.connect(manager).removeFromWhitelist(user1.address);
+        await vault.connect(manager).setWhitelistEnabled(false);
+
+        const shares = await vault.balanceOf(user1.address);
+
+        await expect(
+          vault.connect(user1).redeem(shares, user1.address, user1.address)
+        ).to.not.be.reverted;
+      });
+    });
+
+    describe("Management functions", function () {
+      it("should allow manager to add to whitelist", async function () {
+        await expect(vault.connect(manager).addToWhitelist(user1.address))
+          .to.emit(vault, "AddedToWhitelist")
+          .withArgs(user1.address);
+
+        expect(await vault.whitelisted(user1.address)).to.be.true;
+      });
+
+      it("should allow manager to remove from whitelist", async function () {
+        await vault.connect(manager).addToWhitelist(user1.address);
+
+        await expect(vault.connect(manager).removeFromWhitelist(user1.address))
+          .to.emit(vault, "RemovedFromWhitelist")
+          .withArgs(user1.address);
+
+        expect(await vault.whitelisted(user1.address)).to.be.false;
+      });
+
+      it("should allow manager to enable/disable whitelist", async function () {
+        // Disable
+        await expect(vault.connect(manager).setWhitelistEnabled(false))
+          .to.emit(vault, "WhitelistEnabledUpdated")
+          .withArgs(false);
+
+        expect(await vault.whitelistEnabled()).to.be.false;
+
+        // Re-enable
+        await expect(vault.connect(manager).setWhitelistEnabled(true))
+          .to.emit(vault, "WhitelistEnabledUpdated")
+          .withArgs(true);
+
+        expect(await vault.whitelistEnabled()).to.be.true;
+      });
+
+      it("should allow batch add to whitelist", async function () {
+        const addresses = [user1.address, user2.address];
+
+        const tx = vault.connect(manager).addToWhitelistBatch(addresses);
+
+        await expect(tx)
+          .to.emit(vault, "AddedToWhitelist")
+          .withArgs(user1.address);
+        await expect(tx)
+          .to.emit(vault, "AddedToWhitelist")
+          .withArgs(user2.address);
+
+        expect(await vault.whitelisted(user1.address)).to.be.true;
+        expect(await vault.whitelisted(user2.address)).to.be.true;
+      });
+
+      it("should not allow non-manager to add to whitelist", async function () {
+        await expect(
+          vault.connect(user1).addToWhitelist(user2.address)
+        ).to.be.reverted;
+      });
+
+      it("should not allow non-manager to remove from whitelist", async function () {
+        await vault.connect(manager).addToWhitelist(user1.address);
+
+        await expect(
+          vault.connect(user1).removeFromWhitelist(user1.address)
+        ).to.be.reverted;
+      });
+
+      it("should not allow non-manager to enable/disable whitelist", async function () {
+        await expect(
+          vault.connect(user1).setWhitelistEnabled(false)
+        ).to.be.reverted;
+      });
+
+      it("should not allow non-manager to batch add", async function () {
+        await expect(
+          vault.connect(user1).addToWhitelistBatch([user2.address])
+        ).to.be.reverted;
+      });
+    });
+
+    describe("Default state", function () {
+      it("should have whitelist enabled by default", async function () {
+        expect(await vault.whitelistEnabled()).to.be.true;
+      });
+    });
+
+    describe("ERC4626 view functions", function () {
+      it("maxDeposit should return 0 for non-whitelisted address", async function () {
+        // user1 is not whitelisted
+        expect(await vault.maxDeposit(user1.address)).to.equal(0);
+      });
+
+      it("maxDeposit should return non-zero for whitelisted address", async function () {
+        await vault.connect(manager).addToWhitelist(user1.address);
+        expect(await vault.maxDeposit(user1.address)).to.be.gt(0);
+      });
+
+      it("maxDeposit should return non-zero when whitelist disabled", async function () {
+        await vault.connect(manager).setWhitelistEnabled(false);
+        // user1 is not whitelisted, but whitelist is disabled
+        expect(await vault.maxDeposit(user1.address)).to.be.gt(0);
+      });
+
+      it("maxRedeem should return 0 for non-whitelisted owner", async function () {
+        // Setup: whitelist, deposit, then remove from whitelist
+        await vault.connect(manager).addToWhitelist(user1.address);
+        await vault.connect(user1).deposit(ethers.parseUnits("1000", 6), user1.address);
+        await vault.connect(manager).removeFromWhitelist(user1.address);
+
+        // user1 has shares but is not whitelisted
+        expect(await vault.balanceOf(user1.address)).to.be.gt(0);
+        expect(await vault.maxRedeem(user1.address)).to.equal(0);
+      });
+
+      it("maxRedeem should return balance for whitelisted owner", async function () {
+        await vault.connect(manager).addToWhitelist(user1.address);
+        await vault.connect(user1).deposit(ethers.parseUnits("1000", 6), user1.address);
+
+        const balance = await vault.balanceOf(user1.address);
+        expect(await vault.maxRedeem(user1.address)).to.equal(balance);
+      });
+
+      it("maxRedeem should return balance when whitelist disabled", async function () {
+        // Setup: whitelist, deposit, disable whitelist, remove from whitelist
+        await vault.connect(manager).addToWhitelist(user1.address);
+        await vault.connect(user1).deposit(ethers.parseUnits("1000", 6), user1.address);
+        await vault.connect(manager).setWhitelistEnabled(false);
+        await vault.connect(manager).removeFromWhitelist(user1.address);
+
+        const balance = await vault.balanceOf(user1.address);
+        expect(await vault.maxRedeem(user1.address)).to.equal(balance);
+      });
+    });
+  });
+
   describe("Fee Harvesting", function () {
     it("should not mint fee shares when no profit above HWM", async function () {
+      // Whitelist user1 for deposit
+      await vault.connect(manager).addToWhitelist(user1.address);
+
       // Set targetLTV to 0 to avoid leverage complexity in mocks
       await vault.connect(keeper).rebalance(0);
 
