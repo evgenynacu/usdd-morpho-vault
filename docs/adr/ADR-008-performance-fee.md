@@ -17,12 +17,16 @@ How do we accrue and calculate performance fees?
      - **Only if feeShares > 0**: Update highWaterMark = currentNAV/share
    - If feeShares rounds to 0, HWM is NOT updated (preserves small profits for future harvest)
 
-## Harvest Trigger
+## Fee Accrual Trigger
 
-Fees are **only** collected via explicit `harvestFees()` call by Manager role. This is intentional:
-- Saves gas on user deposit/withdraw operations
-- Allows Manager to choose optimal timing
-- Prevents MEV/sandwich attacks around fee collection
+Fees are **automatically accrued** on every deposit/redeem operation (via `_accruePerformanceFee()`). This ensures:
+- Fairness: fees are always current before any share mint/burn
+- No frontrunning: users can't deposit just before fee harvest to dilute existing holders
+- Accurate NAV: share price calculations always reflect accrued fees
+
+Additionally, `harvestFees()` can be called by KEEPER_ROLE to:
+- Accrue fees when there are no user operations
+- Emit `VaultSnapshot` event for off-chain tracking
 
 ## Fee Calculation Formula
 

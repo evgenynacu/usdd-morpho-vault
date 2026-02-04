@@ -1,4 +1,4 @@
-import { ethers } from "hardhat";
+import { ethers, upgrades } from "hardhat";
 
 async function main() {
   const [deployer] = await ethers.getSigners();
@@ -21,21 +21,28 @@ async function main() {
   console.log("  Performance Fee:", Number(config.performanceFeeBps) / 100 + "%");
   console.log("  Max Total Assets:", ethers.formatUnits(config.maxTotalAssets, 6), "USDT");
 
-  console.log("\nDeploying SUSDDVault...");
+  console.log("\nDeploying SUSDDVault via UUPS proxy...");
 
   const VaultFactory = await ethers.getContractFactory("SUSDDVault");
-  const vault = await VaultFactory.deploy(
-    config.admin,
-    config.feeRecipient,
-    config.targetLTV,
-    config.performanceFeeBps,
-    config.maxTotalAssets
+  const vault = await upgrades.deployProxy(
+    VaultFactory,
+    [
+      config.admin,
+      config.feeRecipient,
+      config.targetLTV,
+      config.performanceFeeBps,
+      config.maxTotalAssets
+    ],
+    { kind: "uups" }
   );
 
   await vault.waitForDeployment();
-  const vaultAddress = await vault.getAddress();
+  const proxyAddress = await vault.getAddress();
+  const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
 
-  console.log("\nSUSDDVault deployed to:", vaultAddress);
+  console.log("\nSUSDDVault deployed:");
+  console.log("  Proxy address:", proxyAddress);
+  console.log("  Implementation address:", implementationAddress);
 
   // Verify deployment
   console.log("\nVerifying deployment...");
@@ -67,10 +74,11 @@ async function main() {
   console.log("  LLTV:", ethers.formatUnits(marketParams.lltv, 16) + "%");
 
   console.log("\n=== Deployment Complete ===");
-  console.log("Vault Address:", vaultAddress);
+  console.log("Proxy Address:", proxyAddress);
+  console.log("Implementation Address:", implementationAddress);
 
   // Return for testing
-  return { vault, vaultAddress };
+  return { vault, proxyAddress, implementationAddress };
 }
 
 main()

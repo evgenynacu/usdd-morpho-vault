@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {IMorpho, Id, MarketParams, Market, Position} from "@morpho-org/morpho-blue/src/interfaces/IMorpho.sol";
 import {IMorphoFlashLoanCallback} from "@morpho-org/morpho-blue/src/interfaces/IMorphoCallbacks.sol";
 import {MarketParamsLib} from "@morpho-org/morpho-blue/src/libraries/MarketParamsLib.sol";
@@ -18,7 +20,15 @@ import "./libraries/SwapHelper.sol";
 /// @title SUSDDVault
 /// @notice Leveraged ERC4626 vault: USDT deposits → leveraged sUSDD position in Morpho Blue
 /// @dev Users deposit USDT, vault creates leveraged sUSDD/USDT position using flash loans
-contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorphoFlashLoanCallback {
+contract SUSDDVault is
+    Initializable,
+    ERC4626Upgradeable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable,
+    IMorphoFlashLoanCallback
+{
     using SafeERC20 for IERC20;
     using MarketParamsLib for MarketParams;
     using MorphoBalancesLib for IMorpho;
@@ -49,6 +59,9 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
 
     /// @notice Cached Morpho market params
     MarketParams public marketParams;
+
+    /// @notice Storage gap for future upgrades
+    uint256[50] private __gap;
 
     // ============ Constants ============
 
@@ -93,22 +106,39 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     error ZeroNAV();
     error DepositTooSmall();
 
-    // ============ Constructor ============
+    // ============ Constructor & Initializer ============
 
-    constructor(
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// @notice Initialize the vault (called once via proxy)
+    /// @param _admin Address to receive all admin roles
+    /// @param _feeRecipient Address to receive performance fees
+    /// @param _targetLTV Target loan-to-value ratio (WAD), IDLE_MODE, or 0
+    /// @param _performanceFeeBps Performance fee in basis points
+    /// @param _maxTotalAssets Maximum total assets (TVL cap)
+    function initialize(
         address _admin,
         address _feeRecipient,
         uint256 _targetLTV,
         uint256 _performanceFeeBps,
         uint256 _maxTotalAssets
-    )
-        ERC20("Leveraged sUSDD Vault", "lsUSDD")
-        ERC4626(IERC20(Constants.USDT))
-    {
+    ) external initializer {
+        // Validate before init
         if (_performanceFeeBps > MAX_PERFORMANCE_FEE_BPS) revert InvalidFee();
         if (_feeRecipient == address(0)) revert InvalidRecipient();
 
-        // Cache market params first (needed for LTV validation)
+        // Initialize parent contracts (order matters for linearization)
+        __ERC20_init("Leveraged sUSDD Vault", "lsUSDD");
+        __ERC4626_init(IERC20(Constants.USDT));
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        // Cache market params (needed for LTV validation)
         IMorpho morpho = IMorpho(Constants.MORPHO);
         marketParams = morpho.idToMarketParams(Id.wrap(Constants.MARKET_ID));
 
@@ -124,7 +154,7 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         _grantRole(MANAGER_ROLE, _admin);
         _grantRole(PAUSER_ROLE, _admin);
 
-        // Initialize parameters
+        // Initialize storage
         targetLTV = _targetLTV;
         performanceFeeBps = _performanceFeeBps;
         feeRecipient = _feeRecipient;
@@ -767,12 +797,18 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         // IMPORTANT: Do NOT call forceApprove here — it would overwrite infinite approval
     }
 
+    // ============ Upgrade Authorization ============
+
+    /// @notice Authorize upgrade to new implementation
+    /// @dev Only DEFAULT_ADMIN_ROLE can upgrade
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+
     // ============ Interface Support ============
 
     function supportsInterface(bytes4 interfaceId)
         public
         view
-        override(AccessControl)
+        override(AccessControlUpgradeable)
         returns (bool)
     {
         return super.supportsInterface(interfaceId);

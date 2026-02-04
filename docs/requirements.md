@@ -33,8 +33,8 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 | Role | Operations |
 |------|------------|
 | **User** | deposit, redeem (see ADR-005: mint/withdraw not supported) |
-| **Keeper** | rebalance (lever/delever) |
-| **Manager** | update fees, set fee recipient, set max TVL, harvest fees |
+| **Keeper** | rebalance (lever/delever), harvestFees (emit heartbeat) |
+| **Manager** | update fees, set fee recipient, set max TVL |
 | **Pauser** | pause/unpause |
 | **Admin** | grant/revoke roles, pause (for emergency: rebalance(IDLE_MODE) THEN pause) |
 
@@ -90,8 +90,9 @@ The vault supports three operating modes based on `targetLTV`:
 
 ### 4.3 Performance Fee
 - Vault charges performance fee on profits above high-water mark
-- Manager calls `harvestFees()` to collect fees as minted shares
-- No fees charged on user actions (gas optimization)
+- Fees are **automatically accrued** on every deposit/redeem (before share mint/burn)
+- Manager can also call `harvestFees()` to accrue fees + emit heartbeat event
+- This ensures fairness: fees are always current before any share price calculation
 
 ---
 

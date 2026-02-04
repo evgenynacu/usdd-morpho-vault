@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { ethers, network } from "hardhat";
+import { ethers, network, upgrades } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 import {
   SUSDDVault,
@@ -95,15 +95,19 @@ describe("Security Unit Tests", function () {
     await usdt.mint(ADDRESSES.PSM, ethers.parseUnits("10000000", 6));
     await usdt.mint(ADDRESSES.MORPHO, ethers.parseUnits("10000000", 6));
 
-    // Deploy vault
+    // Deploy vault via UUPS proxy
     const VaultFactory = await ethers.getContractFactory("SUSDDVault");
-    vault = await VaultFactory.deploy(
-      admin.address,
-      admin.address,
-      ethers.parseEther("0.75"),
-      1000,
-      ethers.parseUnits("10000000", 6)
-    );
+    vault = await upgrades.deployProxy(
+      VaultFactory,
+      [
+        admin.address,
+        admin.address,
+        ethers.parseEther("0.75"),
+        1000,
+        ethers.parseUnits("10000000", 6)
+      ],
+      { kind: "uups" }
+    ) as unknown as SUSDDVault;
 
     await vault.connect(admin).grantRole(await vault.KEEPER_ROLE(), keeper.address);
     await vault.connect(admin).grantRole(await vault.MANAGER_ROLE(), manager.address);

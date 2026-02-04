@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { ethers, network } from "hardhat";
+import { ethers, network, upgrades } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 import {
   SUSDDVault,
@@ -114,15 +114,19 @@ describe("SUSDDVault Unit Tests", function () {
     // Mint USDT directly to Morpho for flash loans (mock needs liquidity)
     await usdt.mint(ADDRESSES.MORPHO, ethers.parseUnits("1000000", 6));
 
-    // Deploy vault
+    // Deploy vault via UUPS proxy
     const VaultFactory = await ethers.getContractFactory("SUSDDVault");
-    vault = await VaultFactory.deploy(
-      admin.address,           // admin
-      admin.address,           // feeRecipient
-      ethers.parseEther("0.75"), // targetLTV (75%)
-      1000,                    // performanceFeeBps (10%)
-      ethers.parseUnits("1000000", 6) // maxTotalAssets
-    );
+    vault = await upgrades.deployProxy(
+      VaultFactory,
+      [
+        admin.address,           // admin
+        admin.address,           // feeRecipient
+        ethers.parseEther("0.75"), // targetLTV (75%)
+        1000,                    // performanceFeeBps (10%)
+        ethers.parseUnits("1000000", 6) // maxTotalAssets
+      ],
+      { kind: "uups" }
+    ) as unknown as SUSDDVault;
 
     // Grant roles
     await vault.connect(admin).grantRole(await vault.KEEPER_ROLE(), keeper.address);
@@ -165,37 +169,31 @@ describe("SUSDDVault Unit Tests", function () {
     it("should accept IDLE_MODE as targetLTV", async function () {
       const VaultFactory = await ethers.getContractFactory("SUSDDVault");
       const IDLE_MODE = ethers.MaxUint256;
-      const idleVault = await VaultFactory.deploy(
-        admin.address,
-        admin.address,
-        IDLE_MODE,
-        1000,
-        ethers.parseUnits("1000000", 6)
-      );
+      const idleVault = await upgrades.deployProxy(
+        VaultFactory,
+        [admin.address, admin.address, IDLE_MODE, 1000, ethers.parseUnits("1000000", 6)],
+        { kind: "uups" }
+      ) as unknown as SUSDDVault;
       expect(await idleVault.targetLTV()).to.equal(IDLE_MODE);
     });
 
     it("should accept 0 as targetLTV (unleveraged mode)", async function () {
       const VaultFactory = await ethers.getContractFactory("SUSDDVault");
-      const unleveragedVault = await VaultFactory.deploy(
-        admin.address,
-        admin.address,
-        0,
-        1000,
-        ethers.parseUnits("1000000", 6)
-      );
+      const unleveragedVault = await upgrades.deployProxy(
+        VaultFactory,
+        [admin.address, admin.address, 0, 1000, ethers.parseUnits("1000000", 6)],
+        { kind: "uups" }
+      ) as unknown as SUSDDVault;
       expect(await unleveragedVault.targetLTV()).to.equal(0);
     });
 
     it("should revert with invalid LTV (> 90%)", async function () {
       const VaultFactory = await ethers.getContractFactory("SUSDDVault");
       await expect(
-        VaultFactory.deploy(
-          admin.address,
-          admin.address,
-          ethers.parseEther("0.91"), // 91% - too high
-          1000,
-          ethers.parseUnits("1000000", 6)
+        upgrades.deployProxy(
+          VaultFactory,
+          [admin.address, admin.address, ethers.parseEther("0.91"), 1000, ethers.parseUnits("1000000", 6)],
+          { kind: "uups" }
         )
       ).to.be.revertedWithCustomError(vault, "InvalidLTV");
     });
@@ -203,12 +201,10 @@ describe("SUSDDVault Unit Tests", function () {
     it("should revert with LTV >= LLTV", async function () {
       const VaultFactory = await ethers.getContractFactory("SUSDDVault");
       await expect(
-        VaultFactory.deploy(
-          admin.address,
-          admin.address,
-          ethers.parseEther("0.86"), // 86% = LLTV
-          1000,
-          ethers.parseUnits("1000000", 6)
+        upgrades.deployProxy(
+          VaultFactory,
+          [admin.address, admin.address, ethers.parseEther("0.86"), 1000, ethers.parseUnits("1000000", 6)],
+          { kind: "uups" }
         )
       ).to.be.revertedWithCustomError(vault, "LTVExceedsLLTV");
     });
@@ -216,12 +212,10 @@ describe("SUSDDVault Unit Tests", function () {
     it("should revert with invalid fee", async function () {
       const VaultFactory = await ethers.getContractFactory("SUSDDVault");
       await expect(
-        VaultFactory.deploy(
-          admin.address,
-          admin.address,
-          ethers.parseEther("0.75"),
-          3001, // > 30%
-          ethers.parseUnits("1000000", 6)
+        upgrades.deployProxy(
+          VaultFactory,
+          [admin.address, admin.address, ethers.parseEther("0.75"), 3001, ethers.parseUnits("1000000", 6)],
+          { kind: "uups" }
         )
       ).to.be.revertedWithCustomError(vault, "InvalidFee");
     });
@@ -229,12 +223,10 @@ describe("SUSDDVault Unit Tests", function () {
     it("should revert with zero fee recipient", async function () {
       const VaultFactory = await ethers.getContractFactory("SUSDDVault");
       await expect(
-        VaultFactory.deploy(
-          admin.address,
-          ethers.ZeroAddress, // Invalid
-          ethers.parseEther("0.75"),
-          1000,
-          ethers.parseUnits("1000000", 6)
+        upgrades.deployProxy(
+          VaultFactory,
+          [admin.address, ethers.ZeroAddress, ethers.parseEther("0.75"), 1000, ethers.parseUnits("1000000", 6)],
+          { kind: "uups" }
         )
       ).to.be.revertedWithCustomError(vault, "InvalidRecipient");
     });
@@ -543,7 +535,8 @@ describe("SUSDDVault Unit Tests", function () {
       const feeRecipientSharesBefore = await vault.balanceOf(admin.address);
 
       // Harvest - should not mint additional shares (no profit above HWM)
-      await vault.connect(manager).harvestFees();
+      // Use admin who has MANAGER_ROLE from initialize
+      await vault.connect(admin).harvestFees();
 
       const totalSupplyAfter = await vault.totalSupply();
       const feeRecipientSharesAfter = await vault.balanceOf(admin.address);
@@ -555,10 +548,11 @@ describe("SUSDDVault Unit Tests", function () {
     });
 
     it("should not harvest when performanceFeeBps is 0", async function () {
-      await vault.connect(manager).setPerformanceFee(0);
+      // Use admin who has MANAGER_ROLE from initialize
+      await vault.connect(admin).setPerformanceFee(0);
 
       // Even if there's profit simulation, no fees should be collected
-      await vault.connect(manager).harvestFees();
+      await vault.connect(admin).harvestFees();
 
       // Just checking it doesn't revert
     });

@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { ethers } from "hardhat";
+import { ethers, upgrades } from "hardhat";
 import { ADDRESSES, MARKET_ID, WAD, DECIMALS } from "./helpers/constants";
 import { SUSDDVault } from "../../typechain-types";
 import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
@@ -39,13 +39,11 @@ describe("SUSDDVault Fork Tests", function () {
 
   async function deployVault() {
     const VaultFactory = await ethers.getContractFactory("SUSDDVault");
-    vault = await VaultFactory.deploy(
-      admin.address,
-      feeRecipient.address,
-      TARGET_LTV,
-      PERFORMANCE_FEE,
-      MAX_TOTAL_ASSETS
-    );
+    vault = await upgrades.deployProxy(
+      VaultFactory,
+      [admin.address, feeRecipient.address, TARGET_LTV, PERFORMANCE_FEE, MAX_TOTAL_ASSETS],
+      { kind: "uups" }
+    ) as unknown as SUSDDVault;
     await vault.waitForDeployment();
     await vault.connect(admin).grantRole(await vault.KEEPER_ROLE(), keeper.address);
   }
