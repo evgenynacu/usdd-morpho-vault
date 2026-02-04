@@ -160,6 +160,28 @@ constructor(...) {
 
 **Important:** Do NOT call `forceApprove` in callbacks — it would overwrite infinite approval with a smaller amount, causing subsequent operations to fail.
 
+### Why Unlimited Approval is Safe for Morpho Blue
+
+| Factor | Morpho Blue |
+|--------|-------------|
+| Upgradeable? | ❌ No — immutable singleton contract |
+| Admin functions? | ❌ No owner, no governance, no admin keys |
+| When tokens are pulled | Only on explicit calls: `repay()`, `supplyCollateral()`, flash loan callback |
+| Audits | Multiple (Spearbit, Trail of Bits, etc.) |
+| TVL | $2B+ — battle-tested |
+
+**Key points:**
+
+1. Morpho Blue is **immutable** — no proxy, no upgrade path, no way to change contract logic
+2. Morpho **only pulls exact amounts** requested in each operation (never more)
+3. Per-operation approval would cost +25-45k gas per operation
+4. For flash loans, approval must exist BEFORE callback (can't approve exact amount inside callback)
+
+**When NOT to use unlimited approval:**
+- Upgradeable proxy contracts
+- Contracts with owner/admin that could be compromised
+- New/unaudited protocols
+
 ---
 
 ## Rationale
@@ -189,63 +211,64 @@ borrowAmount = depositedUsdt * targetLTV / (1 - targetLTV)
 
 **Withdrawal proportional amounts:**
 ```
-withdrawRatio = usdtToWithdraw / NAV
+withdrawRatio = shares / totalSupply  (shares-based, no NAV needed)
 
 // Proportional from idle
 idleToWithdraw = idleUsdt * withdrawRatio
 
 // Proportional from position
 collateralToWithdraw = totalCollateral * withdrawRatio
-debtToRepay = totalDebt * withdrawRatio
+sharesToRepay = totalBorrowShares * withdrawRatio
 ```
 
-Note: We use NAV as the denominator because we're withdrawing proportionally from ALL assets (both idle and position). This ensures fairness across all users.
+Note: We use shares ratio (not NAV ratio) because it's mathematically equivalent but simpler and cheaper (no `totalAssets()` call needed).
 
 ## Withdraw Algorithm Details
 
-### Full Withdraw Detection
+### Shares-Based Approach
 
-Full position unwind happens only when ALL vault shares are burned:
+Withdrawal uses **shares-based ratio** for all calculations:
 
 ```solidity
-bool isFullWithdraw = (totalSupply() == 0);
+uint256 withdrawRatio = (shares * WAD) / totalSupply();
+
+// Apply ratio to idle and position
+uint256 idleToWithdraw = (idleUsdt * withdrawRatio) / WAD;
+uint256 sharesToRepay = (pos.borrowShares * withdrawRatio) / WAD;
+uint256 collateralToWithdraw = (pos.collateral * withdrawRatio) / WAD;
 ```
 
-This ensures:
-- **Dust-free exit** for the last user — no micro-debt or collateral remains
-- **Predictable behavior** — no magic percentage thresholds
-- **Fairness** — other users' positions unaffected by large withdrawals
-
-Previously used 99% threshold, but that caused unexpected full unwinds on large partial withdrawals.
+**Why shares-based?**
+- `shares / totalSupply == assets / NAV` (mathematically equivalent)
+- No expensive `totalAssets()` call needed
+- Simpler code, fewer edge cases
 
 ### Debt Repayment Strategy
 
-| Scenario | Method | Reason |
-|----------|--------|--------|
-| Full withdraw | `repay(0, borrowShares)` | Exact clearance, no dust |
-| Partial withdraw | `repay(assets, 0)` | Proportional reduction |
-
-**Why this matters:** Morpho rounds UP when converting assets→shares for repay. This can leave micro-debt on partial withdrawals. Full withdraw avoids this by specifying exact shares to burn.
+**Always repay by shares** — both full and partial withdrawals:
 
 ```solidity
-// Full withdraw — repay by shares (exact)
-if (isFullWithdraw && pos.borrowShares > 0) {
-    morpho.repay(marketParams, 0, pos.borrowShares, address(this), "");
-}
-
-// Partial withdraw — repay by assets
-morpho.repay(marketParams, repayAmount, 0, address(this), "");
+morpho.repay(marketParams, 0, sharesToRepay, address(this), "");
 ```
+
+| Scenario | sharesToRepay | Result |
+|----------|---------------|--------|
+| Full withdraw (100%) | `pos.borrowShares` | All debt cleared |
+| Partial withdraw (X%) | `pos.borrowShares * X%` | Proportional debt reduction |
+
+**Why always shares?** Shares-based repay is exact — no rounding issues that can leave micro-debt.
 
 ### Proportional Withdrawal (Fairness First)
 
 The vault uses **proportional withdrawal** — both idle USDT and position are withdrawn in the same ratio:
 
 ```
-withdraw(300 USDT) when NAV=1000, idle=100, position=900:
+redeem(300 shares) when totalSupply=1000, idle=100 USDT, position equity=900 USDT:
 ├── ratio = 300/1000 = 30%
-├── idle: 100 * 30% = 30 USDT
-└── position: 900 * 30% = 270 USDT (unwind)
+├── idleToWithdraw: 100 * 30% = 30 USDT
+├── collateralToWithdraw: collateral * 30%
+├── sharesToRepay: borrowShares * 30%
+└── User receives: idleToWithdraw + (collateral_value - debt_repaid)
 ```
 
 **Why proportional?**
@@ -259,21 +282,42 @@ withdraw(300 USDT) when NAV=1000, idle=100, position=900:
 
 **Example: Bank run scenario**
 ```
-Vault: idle=500, position=500, NAV=1000
+Vault: 1000 shares, idle=500 USDT, position=500 USDT equity
 
 With idle-first:
-├── User A (50%) withdraws first → gets 500 from idle (cheap)
-└── User B (50%) withdraws second → must unwind entire position (expensive)
+├── User A (500 shares) withdraws first → gets 500 from idle (cheap)
+└── User B (500 shares) withdraws second → must unwind entire position (expensive)
 
 With proportional:
-├── User A (50%) → 250 idle + 250 from position
-└── User B (50%) → 250 idle + 250 from position
+├── User A (500 shares) → 250 idle + 250 from position
+└── User B (500 shares) → 250 idle + 250 from position
 Both pay the same! ✓
 ```
+
+### Actual Transfer Amount
+
+The vault transfers what was **actually received**, not a pre-calculated estimate:
+
+```solidity
+uint256 balanceBefore = USDT.balanceOf(this);
+// ... unwind position via flash loan ...
+uint256 balanceAfter = USDT.balanceOf(this);
+
+uint256 gainFromPosition = balanceAfter - balanceBefore;
+uint256 toTransfer = idleToWithdraw + gainFromPosition;
+USDT.safeTransfer(receiver, toTransfer);
+```
+
+This approach:
+- Returns the real amount to user (no estimates)
+- Naturally handles rounding in the user's favor (equity margin covers rounding)
+- Simpler code with fewer failure modes
 
 ---
 
 ## Delever Algorithm Details
+
+> **Note:** Delever uses a 0.1% buffer, but **withdrawal does not**. Withdrawal is purely proportional — the equity margin naturally covers any rounding.
 
 ### Partial Delever (rebalance to lower LTV)
 

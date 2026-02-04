@@ -25,6 +25,7 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     using SharesMathLib for uint256;
 
     // ============ Roles ============
+
     bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
@@ -83,7 +84,6 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     error MaxTotalAssetsExceeded();
     error FlashLoanCallbackFailed();
     error UnauthorizedCallback();
-    error InsufficientWithdrawBalance();
     error ZeroNAV();
     error DepositTooSmall();
 
@@ -128,7 +128,7 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         IERC20(Constants.SUSDD).forceApprove(Constants.MORPHO, type(uint256).max);
     }
 
-    // ============ ERC4626 Overrides ============
+    // ============ ERC4626 View Functions ============
 
     /// @notice Total assets under management in USDT terms
     /// @dev NAV = idle USDT + (sUSDD collateral value) - USDT debt
@@ -170,36 +170,11 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
 
     /// @notice Maximum mint amount (returns 0 - mint not supported)
     function maxMint(address) public pure override returns (uint256) {
-        return 0; // mint() not supported, use deposit()
+        return 0;
     }
 
     /// @notice Maximum withdraw amount (returns 0 - withdraw not supported)
     function maxWithdraw(address) public pure override returns (uint256) {
-        return 0; // withdraw() not supported, use redeem()
-    }
-
-    /// @notice Mint is not supported - use deposit() instead
-    /// @dev Delta NAV approach makes exact share minting impractical.
-    ///      User cannot predict exact shares they'll receive because shares
-    ///      depend on actual NAV change after position is built.
-    function mint(uint256, address) public pure override returns (uint256) {
-        revert("mint() not supported, use deposit()");
-    }
-
-    /// @notice Withdraw is not supported - use redeem() instead
-    /// @dev With proportional withdrawal, specifying exact assets is impractical.
-    ///      User should redeem shares and receive proportional USDT.
-    function withdraw(uint256, address, address) public pure override returns (uint256) {
-        revert("withdraw() not supported, use redeem()");
-    }
-
-    /// @notice Preview mint returns 0 (mint not supported)
-    function previewMint(uint256) public pure override returns (uint256) {
-        return 0;
-    }
-
-    /// @notice Preview withdraw returns 0 (withdraw not supported)
-    function previewWithdraw(uint256) public pure override returns (uint256) {
         return 0;
     }
 
@@ -225,37 +200,39 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         return (estimatedValueAdded * supply) / nav;
     }
 
+    /// @notice Preview mint returns 0 (mint not supported)
+    function previewMint(uint256) public pure override returns (uint256) {
+        return 0;
+    }
+
+    /// @notice Preview withdraw returns 0 (withdraw not supported)
+    function previewWithdraw(uint256) public pure override returns (uint256) {
+        return 0;
+    }
+
     /// @notice Convert assets to shares (consistent with Delta NAV)
     function convertToShares(uint256 assets) public view override returns (uint256) {
         return previewDeposit(assets);
     }
 
-    /// @notice Estimate the NAV increase from depositing assets
-    /// @dev Assumes PSM tin/tout = 0 (see requirements.md "PSM Fee Assumption")
-    function _estimateDepositValue(uint256 assets) internal view returns (uint256) {
-        if (targetLTV == 0) {
-            // No leverage: USDT stays idle, value = assets
-            return assets;
-        }
+    // ============ ERC4626 Disabled ============
 
-        // With leverage:
-        // borrowAmount = assets * LTV / (1 - LTV)
-        // totalUSDT = assets + borrowAmount = assets / (1 - LTV)
-        // sUSDD = swap(totalUSDT)
-        // NAV increase = sUSDD_value - borrowAmount
-
-        uint256 borrowAmount = (assets * targetLTV) / (Constants.WAD - targetLTV);
-        uint256 totalUsdt = assets + borrowAmount;
-
-        uint256 susddAmount = SwapHelper.previewSwapUSDTtoSUSDD(totalUsdt);
-        uint256 susddValue = SwapHelper.getUSDTValue(susddAmount);
-
-        // NAV increase = collateral value - debt
-        if (susddValue > borrowAmount) {
-            return susddValue - borrowAmount;
-        }
-        return 0;
+    /// @notice Mint is not supported - use deposit() instead
+    /// @dev Delta NAV approach makes exact share minting impractical.
+    ///      User cannot predict exact shares they'll receive because shares
+    ///      depend on actual NAV change after position is built.
+    function mint(uint256, address) public pure override returns (uint256) {
+        revert("mint() not supported, use deposit()");
     }
+
+    /// @notice Withdraw is not supported - use redeem() instead
+    /// @dev With proportional withdrawal, specifying exact assets is impractical.
+    ///      User should redeem shares and receive proportional USDT.
+    function withdraw(uint256, address, address) public pure override returns (uint256) {
+        revert("withdraw() not supported, use redeem()");
+    }
+
+    // ============ Deposit ============
 
     /// @notice Deposit USDT and build leveraged position
     /// @dev Uses DELTA NAV approach: shares are calculated based on actual NAV increase,
@@ -266,11 +243,11 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         nonReentrant
         whenNotPaused
     {
-        if (assets + totalAssets() > maxTotalAssets) revert MaxTotalAssetsExceeded();
-
-        // 1. Snapshot state BEFORE
+        // 1. Snapshot state BEFORE (cache to avoid duplicate SLOAD)
         uint256 navBefore = totalAssets();
         uint256 supplyBefore = totalSupply();
+
+        if (assets + navBefore > maxTotalAssets) revert MaxTotalAssetsExceeded();
 
         // Block deposits if vault is underwater (NAV=0 but shares exist)
         // This prevents dilution of existing holders
@@ -308,29 +285,171 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         emit Deposit(caller, receiver, assets, actualShares);
     }
 
-    /// @notice Withdraw USDT by unwinding leveraged position
-    function _withdraw(
-        address caller,
-        address receiver,
-        address owner,
-        uint256 assets,
-        uint256 shares
-    ) internal override nonReentrant {
-        // Check allowance if caller is not owner
+    /// @notice Estimate the NAV increase from depositing assets
+    /// @dev Assumes PSM tin/tout = 0 (see requirements.md "PSM Fee Assumption")
+    function _estimateDepositValue(uint256 assets) internal view returns (uint256) {
+        if (targetLTV == 0) {
+            // No leverage: USDT stays idle, value = assets
+            return assets;
+        }
+
+        // With leverage:
+        // borrowAmount = assets * LTV / (1 - LTV)
+        // totalUSDT = assets + borrowAmount = assets / (1 - LTV)
+        // sUSDD = swap(totalUSDT)
+        // NAV increase = sUSDD_value - borrowAmount
+
+        uint256 borrowAmount = (assets * targetLTV) / (Constants.WAD - targetLTV);
+        uint256 totalUsdt = assets + borrowAmount;
+
+        uint256 susddAmount = SwapHelper.previewSwapUSDTtoSUSDD(totalUsdt);
+        uint256 susddValue = SwapHelper.getUSDTValue(susddAmount);
+
+        // NAV increase = collateral value - debt
+        if (susddValue > borrowAmount) {
+            return susddValue - borrowAmount;
+        }
+        return 0;
+    }
+
+    /// @notice Build leveraged position from deposited USDT
+    function _buildPosition(uint256 depositedUsdt) internal {
+        // Calculate how much to borrow for target LTV
+        // totalCollateralValue = depositedUsdt / (1 - targetLTV)
+        // borrowAmount = totalCollateralValue * targetLTV = depositedUsdt * targetLTV / (1 - targetLTV)
+        uint256 borrowAmount = (depositedUsdt * targetLTV) / (Constants.WAD - targetLTV);
+
+        if (borrowAmount == 0) {
+            // No leverage needed, just convert USDT to sUSDD and supply as collateral
+            uint256 susddAmount = SwapHelper.swapUSDTtoSUSDD(depositedUsdt);
+            IMorpho(Constants.MORPHO).supplyCollateral(marketParams, susddAmount, address(this), "");
+            return;
+        }
+
+        // Use flash loan to build position atomically
+        bytes memory data = abi.encode(OP_DEPOSIT, depositedUsdt);
+        IMorpho(Constants.MORPHO).flashLoan(Constants.USDT, borrowAmount, data);
+    }
+
+    /// @notice Handle deposit flash loan callback
+    function _handleDepositCallback(uint256 flashLoanAmount, uint256 depositedUsdt) internal {
+        // Total USDT available = deposited + flash loan
+        uint256 totalUsdt = depositedUsdt + flashLoanAmount;
+
+        // Convert all USDT to sUSDD
+        uint256 susddAmount = SwapHelper.swapUSDTtoSUSDD(totalUsdt);
+
+        // Supply sUSDD as collateral
+        IMorpho morpho = IMorpho(Constants.MORPHO);
+        morpho.supplyCollateral(marketParams, susddAmount, address(this), "");
+
+        // Borrow USDT to repay flash loan
+        morpho.borrow(marketParams, flashLoanAmount, 0, address(this), address(this));
+    }
+
+    // ============ Withdraw ============
+
+    /// @notice Redeem shares for USDT
+    /// @dev Proportional withdrawal - user receives their share of idle USDT + position equity
+    /// @param shares Amount of shares to burn
+    /// @param receiver Address to receive USDT
+    /// @param owner Address that owns the shares
+    /// @return assets Actual USDT amount transferred
+    function redeem(uint256 shares, address receiver, address owner)
+        public
+        override
+        nonReentrant
+        returns (uint256)
+    {
+        uint256 maxShares = maxRedeem(owner);
+        if (shares > maxShares) {
+            revert ERC4626ExceededMaxRedeem(owner, shares, maxShares);
+        }
+
+        address caller = _msgSender();
         if (caller != owner) {
             _spendAllowance(owner, caller, shares);
         }
 
+        // Calculate withdrawal ratio BEFORE burning (shares-based, no NAV needed)
+        uint256 supplyBefore = totalSupply();
+        uint256 withdrawRatio = (shares * Constants.WAD) / supplyBefore;
+
         // Burn shares
         _burn(owner, shares);
 
+        // Unwind position and get actual USDT amount
+        uint256 assets = _unwindPosition(withdrawRatio, receiver);
+
         emit Withdraw(caller, receiver, owner, assets, shares);
 
-        // Unwind position to get USDT
-        _unwindPosition(assets, receiver);
+        return assets;
     }
 
-    // ============ Keeper Functions ============
+    /// @notice Unwind position to withdraw USDT
+    /// @dev Uses PROPORTIONAL withdrawal for fairness: both idle USDT and position
+    ///      are withdrawn in the same ratio. This ensures all users pay similar
+    ///      gas/fees regardless of withdrawal order.
+    /// @param withdrawRatio Proportion to withdraw (in WAD), calculated from shares
+    /// @return assets Actual USDT amount transferred to receiver
+    function _unwindPosition(uint256 withdrawRatio, address receiver) internal returns (uint256) {
+        uint256 balanceBefore = IERC20(Constants.USDT).balanceOf(address(this));
+        uint256 idleToWithdraw = (balanceBefore * withdrawRatio) / Constants.WAD;
+
+        IMorpho morpho = IMorpho(Constants.MORPHO);
+        Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
+
+        // Proportionally unwind position (if exists)
+        if (pos.collateral > 0) {
+            uint256 sharesToRepay = (uint256(pos.borrowShares) * withdrawRatio) / Constants.WAD;
+            uint256 collateralToWithdraw = (uint256(pos.collateral) * withdrawRatio) / Constants.WAD;
+
+            if (sharesToRepay > 0) {
+                // Calculate flash loan amount from shares (with interest accrual)
+                (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
+                uint256 flashLoanAmount = sharesToRepay.toAssetsUp(totalBorrowAssets, totalBorrowShares);
+
+                // Flash loan to repay debt - pass sharesToRepay and collateralToWithdraw
+                bytes memory data = abi.encode(OP_WITHDRAW, sharesToRepay, collateralToWithdraw);
+                morpho.flashLoan(Constants.USDT, flashLoanAmount, data);
+            } else if (collateralToWithdraw > 0) {
+                // No debt, just withdraw collateral
+                morpho.withdrawCollateral(marketParams, collateralToWithdraw, address(this), address(this));
+                SwapHelper.swapSUSDDtoUSDT(collateralToWithdraw);
+            }
+        }
+
+        // Transfer proportional idle + net gain from position unwind
+        uint256 balanceAfter = IERC20(Constants.USDT).balanceOf(address(this));
+        uint256 gainFromPosition = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
+        uint256 toTransfer = idleToWithdraw + gainFromPosition;
+        IERC20(Constants.USDT).safeTransfer(receiver, toTransfer);
+
+        return toTransfer;
+    }
+
+    /// @notice Handle withdraw flash loan callback
+    /// @param sharesToRepay Exact borrow shares to repay (calculated proportionally)
+    /// @param collateralToWithdraw Exact collateral to withdraw (calculated proportionally)
+    function _handleWithdrawCallback(uint256 sharesToRepay, uint256 collateralToWithdraw) internal {
+        IMorpho morpho = IMorpho(Constants.MORPHO);
+
+        // Repay debt by shares - works for both full and partial withdrawal
+        // Full: sharesToRepay = all shares, Partial: sharesToRepay = shares * ratio
+        if (sharesToRepay > 0) {
+            morpho.repay(marketParams, 0, sharesToRepay, address(this), "");
+        }
+
+        // Withdraw collateral
+        if (collateralToWithdraw > 0) {
+            morpho.withdrawCollateral(marketParams, collateralToWithdraw, address(this), address(this));
+            SwapHelper.swapSUSDDtoUSDT(collateralToWithdraw);
+        }
+
+        // Flash loan will be repaid from the USDT we got
+    }
+
+    // ============ Rebalance (Keeper) ============
 
     /// @notice Rebalance the position to a new target LTV
     /// @param newTargetLTV New LTV target (0 for full delever)
@@ -388,236 +507,6 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         }
 
         emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
-    }
-
-    // ============ Manager Functions ============
-
-    /// @notice Set performance fee
-    function setPerformanceFee(uint256 newFeeBps) external onlyRole(MANAGER_ROLE) {
-        if (newFeeBps > MAX_PERFORMANCE_FEE_BPS) revert InvalidFee();
-        uint256 oldFee = performanceFeeBps;
-        performanceFeeBps = newFeeBps;
-        emit PerformanceFeeUpdated(oldFee, newFeeBps);
-    }
-
-    /// @notice Set fee recipient
-    function setFeeRecipient(address newRecipient) external onlyRole(MANAGER_ROLE) {
-        if (newRecipient == address(0)) revert InvalidRecipient();
-        address oldRecipient = feeRecipient;
-        feeRecipient = newRecipient;
-        emit FeeRecipientUpdated(oldRecipient, newRecipient);
-    }
-
-    /// @notice Set max total assets
-    function setMaxTotalAssets(uint256 newMax) external onlyRole(MANAGER_ROLE) {
-        uint256 oldMax = maxTotalAssets;
-        maxTotalAssets = newMax;
-        emit MaxTotalAssetsUpdated(oldMax, newMax);
-    }
-
-    /// @notice Harvest performance fees
-    /// @dev Mints new shares to feeRecipient based on profit above high water mark
-    function harvestFees() external onlyRole(MANAGER_ROLE) nonReentrant {
-        if (performanceFeeBps == 0 || totalSupply() == 0) return;
-
-        // Calculate current value per share (in WAD)
-        uint256 currentValuePerShare = (totalAssets() * 1e18) / totalSupply();
-
-        if (currentValuePerShare <= highWaterMark) {
-            // No profit above HWM
-            return;
-        }
-
-        // Calculate profit per share
-        uint256 profitPerShare = currentValuePerShare - highWaterMark;
-
-        // Calculate fee per share
-        uint256 feePerShare = (profitPerShare * performanceFeeBps) / MAX_BPS;
-
-        // Calculate fee shares to mint
-        // feeShares = totalSupply * feePerShare / (currentValuePerShare - feePerShare)
-        uint256 feeShares = (totalSupply() * feePerShare) / (currentValuePerShare - feePerShare);
-
-        if (feeShares > 0) {
-            _mint(feeRecipient, feeShares);
-            emit PerformanceFeeHarvested(feeShares, feeRecipient);
-        }
-
-        // Update high water mark
-        highWaterMark = currentValuePerShare;
-    }
-
-    // ============ Pauser Functions ============
-
-    /// @notice Pause deposits and rebalancing (withdrawals still allowed)
-    function pause() external onlyRole(PAUSER_ROLE) {
-        _pause();
-    }
-
-    /// @notice Unpause the vault
-    function unpause() external onlyRole(PAUSER_ROLE) {
-        _unpause();
-    }
-
-    // ============ Flash Loan Callback ============
-
-    /// @notice Morpho flash loan callback
-    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external override {
-        if (msg.sender != Constants.MORPHO) revert UnauthorizedCallback();
-
-        // First decode operation type
-        uint8 operation = abi.decode(data, (uint8));
-
-        if (operation == OP_DEPOSIT) {
-            (, uint256 depositedUsdt) = abi.decode(data, (uint8, uint256));
-            _handleDepositCallback(assets, depositedUsdt);
-        } else if (operation == OP_WITHDRAW) {
-            (, uint256 sharesToRepay, uint256 collateralToWithdraw) = abi.decode(data, (uint8, uint256, uint256));
-            _handleWithdrawCallback(sharesToRepay, collateralToWithdraw);
-        } else if (operation == OP_REBALANCE) {
-            (, uint256 direction, bool withdrawAllCollateral) = abi.decode(data, (uint8, uint256, bool));
-            _handleRebalanceCallback(assets, direction, withdrawAllCollateral);
-        } else {
-            revert FlashLoanCallbackFailed();
-        }
-
-        // Flash loan repayment: Morpho calls safeTransferFrom to pull back `assets`
-        // Approval was set in constructor (infinite approve to Morpho)
-        // IMPORTANT: Do NOT call forceApprove here — it would overwrite infinite approval
-    }
-
-    // ============ Internal Functions ============
-
-    /// @notice Build leveraged position from deposited USDT
-    function _buildPosition(uint256 depositedUsdt) internal {
-        // Calculate how much to borrow for target LTV
-        // totalCollateralValue = depositedUsdt / (1 - targetLTV)
-        // borrowAmount = totalCollateralValue * targetLTV = depositedUsdt * targetLTV / (1 - targetLTV)
-        uint256 borrowAmount = (depositedUsdt * targetLTV) / (Constants.WAD - targetLTV);
-
-        if (borrowAmount == 0) {
-            // No leverage needed, just convert USDT to sUSDD and supply as collateral
-            uint256 susddAmount = SwapHelper.swapUSDTtoSUSDD(depositedUsdt);
-            IMorpho(Constants.MORPHO).supplyCollateral(marketParams, susddAmount, address(this), "");
-            return;
-        }
-
-        // Use flash loan to build position atomically
-        bytes memory data = abi.encode(OP_DEPOSIT, depositedUsdt);
-        IMorpho(Constants.MORPHO).flashLoan(Constants.USDT, borrowAmount, data);
-    }
-
-    /// @notice Handle deposit flash loan callback
-    function _handleDepositCallback(uint256 flashLoanAmount, uint256 depositedUsdt) internal {
-        // Total USDT available = deposited + flash loan
-        uint256 totalUsdt = depositedUsdt + flashLoanAmount;
-
-        // Convert all USDT to sUSDD
-        uint256 susddAmount = SwapHelper.swapUSDTtoSUSDD(totalUsdt);
-
-        // Supply sUSDD as collateral
-        IMorpho morpho = IMorpho(Constants.MORPHO);
-        morpho.supplyCollateral(marketParams, susddAmount, address(this), "");
-
-        // Borrow USDT to repay flash loan
-        morpho.borrow(marketParams, flashLoanAmount, 0, address(this), address(this));
-    }
-
-    /// @notice Unwind position to withdraw USDT
-    /// @dev Uses PROPORTIONAL withdrawal for fairness: both idle USDT and position
-    ///      are withdrawn in the same ratio. This ensures all users pay similar
-    ///      gas/fees regardless of withdrawal order.
-    function _unwindPosition(uint256 usdtToWithdraw, address receiver) internal {
-        uint256 nav = totalAssets();
-        if (nav == 0) revert ZeroNAV();
-
-        uint256 idleUsdt = IERC20(Constants.USDT).balanceOf(address(this));
-        IMorpho morpho = IMorpho(Constants.MORPHO);
-        Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
-
-        // Full withdraw if all shares have been burned (last user exiting)
-        bool isFullWithdraw = (totalSupply() == 0);
-
-        // Calculate withdrawal ratio (in WAD for precision)
-        // ratio = usdtToWithdraw / nav
-        uint256 withdrawRatio = isFullWithdraw
-            ? Constants.WAD
-            : (usdtToWithdraw * Constants.WAD) / nav;
-
-        // Proportionally withdraw from idle USDT
-        uint256 idleToWithdraw = isFullWithdraw
-            ? idleUsdt
-            : (idleUsdt * withdrawRatio) / Constants.WAD;
-
-        // Proportionally unwind position (if exists)
-        uint256 positionToUnwind = usdtToWithdraw > idleToWithdraw
-            ? usdtToWithdraw - idleToWithdraw
-            : 0;
-
-        if (positionToUnwind > 0) {
-            if (pos.collateral == 0) {
-                revert InsufficientWithdrawBalance();
-            }
-
-            // Calculate proportional shares and collateral to withdraw
-            // Both use the same withdrawRatio on raw position values
-            uint256 sharesToRepay = (uint256(pos.borrowShares) * withdrawRatio) / Constants.WAD;
-            uint256 collateralToWithdraw = (uint256(pos.collateral) * withdrawRatio) / Constants.WAD;
-
-            // Add buffer to collateral for swap rounding (toAssetsUp rounds up flash loan,
-            // but swap rounds down, so we need slightly more collateral to cover)
-            if (!isFullWithdraw) {
-                collateralToWithdraw = (collateralToWithdraw * (Constants.BPS_DENOMINATOR + Constants.DELEVER_BUFFER_BPS)) / Constants.BPS_DENOMINATOR;
-            }
-
-            // Cap to actual position (safety check)
-            if (sharesToRepay > pos.borrowShares) {
-                sharesToRepay = pos.borrowShares;
-            }
-            if (collateralToWithdraw > pos.collateral) {
-                collateralToWithdraw = pos.collateral;
-            }
-
-            if (sharesToRepay > 0) {
-                // Calculate flash loan amount from shares (with interest accrual)
-                (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
-                uint256 flashLoanAmount = sharesToRepay.toAssetsUp(totalBorrowAssets, totalBorrowShares);
-
-                // Flash loan to repay debt - pass sharesToRepay and collateralToWithdraw
-                bytes memory data = abi.encode(OP_WITHDRAW, sharesToRepay, collateralToWithdraw);
-                morpho.flashLoan(Constants.USDT, flashLoanAmount, data);
-            } else if (collateralToWithdraw > 0) {
-                // No debt, just withdraw collateral
-                morpho.withdrawCollateral(marketParams, collateralToWithdraw, address(this), address(this));
-                SwapHelper.swapSUSDDtoUSDT(collateralToWithdraw);
-            }
-        }
-
-        // Transfer USDT to receiver
-        uint256 finalBalance = IERC20(Constants.USDT).balanceOf(address(this));
-        if (finalBalance < usdtToWithdraw) revert InsufficientWithdrawBalance();
-        IERC20(Constants.USDT).safeTransfer(receiver, usdtToWithdraw);
-    }
-
-    /// @notice Handle withdraw flash loan callback
-    /// @param sharesToRepay Exact borrow shares to repay (calculated proportionally)
-    /// @param collateralToWithdraw Exact collateral to withdraw (calculated proportionally)
-    function _handleWithdrawCallback(uint256 sharesToRepay, uint256 collateralToWithdraw) internal {
-        IMorpho morpho = IMorpho(Constants.MORPHO);
-
-        // Repay debt by shares - works for both full and partial withdrawal
-        // Full: sharesToRepay = all shares, Partial: sharesToRepay = shares * ratio
-        if (sharesToRepay > 0) {
-            morpho.repay(marketParams, 0, sharesToRepay, address(this), "");
-        }
-
-        // Withdraw collateral
-        if (collateralToWithdraw > 0) {
-            morpho.withdrawCollateral(marketParams, collateralToWithdraw, address(this), address(this));
-            SwapHelper.swapSUSDDtoUSDT(collateralToWithdraw);
-        }
-
-        // Flash loan will be repaid from the USDT we got
     }
 
     /// @notice Lever up: borrow more and add collateral
@@ -696,7 +585,106 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         }
     }
 
-    // ============ ERC20 Overrides for AccessControl ============
+    // ============ Manager Functions ============
+
+    /// @notice Set performance fee
+    function setPerformanceFee(uint256 newFeeBps) external onlyRole(MANAGER_ROLE) {
+        if (newFeeBps > MAX_PERFORMANCE_FEE_BPS) revert InvalidFee();
+        uint256 oldFee = performanceFeeBps;
+        performanceFeeBps = newFeeBps;
+        emit PerformanceFeeUpdated(oldFee, newFeeBps);
+    }
+
+    /// @notice Set fee recipient
+    function setFeeRecipient(address newRecipient) external onlyRole(MANAGER_ROLE) {
+        if (newRecipient == address(0)) revert InvalidRecipient();
+        address oldRecipient = feeRecipient;
+        feeRecipient = newRecipient;
+        emit FeeRecipientUpdated(oldRecipient, newRecipient);
+    }
+
+    /// @notice Set max total assets
+    function setMaxTotalAssets(uint256 newMax) external onlyRole(MANAGER_ROLE) {
+        uint256 oldMax = maxTotalAssets;
+        maxTotalAssets = newMax;
+        emit MaxTotalAssetsUpdated(oldMax, newMax);
+    }
+
+    /// @notice Harvest performance fees
+    /// @dev Mints new shares to feeRecipient based on profit above high water mark
+    function harvestFees() external onlyRole(MANAGER_ROLE) nonReentrant {
+        // Cache totalSupply to avoid multiple SLOAD operations
+        uint256 supply = totalSupply();
+        if (performanceFeeBps == 0 || supply == 0) return;
+
+        // Calculate current value per share (in WAD)
+        uint256 nav = totalAssets();
+        uint256 currentValuePerShare = (nav * 1e18) / supply;
+
+        if (currentValuePerShare <= highWaterMark) {
+            // No profit above HWM
+            return;
+        }
+
+        // Calculate profit per share
+        uint256 profitPerShare = currentValuePerShare - highWaterMark;
+
+        // Calculate fee per share
+        uint256 feePerShare = (profitPerShare * performanceFeeBps) / MAX_BPS;
+
+        // Calculate fee shares to mint
+        // feeShares = totalSupply * feePerShare / (currentValuePerShare - feePerShare)
+        uint256 feeShares = (supply * feePerShare) / (currentValuePerShare - feePerShare);
+
+        if (feeShares > 0) {
+            _mint(feeRecipient, feeShares);
+            emit PerformanceFeeHarvested(feeShares, feeRecipient);
+        }
+
+        // Update high water mark
+        highWaterMark = currentValuePerShare;
+    }
+
+    // ============ Pauser Functions ============
+
+    /// @notice Pause deposits and rebalancing (withdrawals still allowed)
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /// @notice Unpause the vault
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    // ============ Flash Loan Callback ============
+
+    /// @notice Morpho flash loan callback
+    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external override {
+        if (msg.sender != Constants.MORPHO) revert UnauthorizedCallback();
+
+        // First decode operation type
+        uint8 operation = abi.decode(data, (uint8));
+
+        if (operation == OP_DEPOSIT) {
+            (, uint256 depositedUsdt) = abi.decode(data, (uint8, uint256));
+            _handleDepositCallback(assets, depositedUsdt);
+        } else if (operation == OP_WITHDRAW) {
+            (, uint256 sharesToRepay, uint256 collateralToWithdraw) = abi.decode(data, (uint8, uint256, uint256));
+            _handleWithdrawCallback(sharesToRepay, collateralToWithdraw);
+        } else if (operation == OP_REBALANCE) {
+            (, uint256 direction, bool withdrawAllCollateral) = abi.decode(data, (uint8, uint256, bool));
+            _handleRebalanceCallback(assets, direction, withdrawAllCollateral);
+        } else {
+            revert FlashLoanCallbackFailed();
+        }
+
+        // Flash loan repayment: Morpho calls safeTransferFrom to pull back `assets`
+        // Approval was set in constructor (infinite approve to Morpho)
+        // IMPORTANT: Do NOT call forceApprove here — it would overwrite infinite approval
+    }
+
+    // ============ Interface Support ============
 
     function supportsInterface(bytes4 interfaceId)
         public

@@ -95,8 +95,7 @@ When `targetLTV = 0`:
 | `InvalidFee` | performanceFeeBps > 30% |
 | `InvalidRecipient` | feeRecipient is zero address |
 | `MaxTotalAssetsExceeded` | Deposit would exceed TVL cap |
-| `InsufficientWithdrawBalance` | Cannot fulfill withdrawal amount |
-| `ZeroNAV` | NAV is zero (underwater position) |
+| `ZeroNAV` | NAV is zero on deposit (underwater position) |
 | `DepositTooSmall` | Deposit rounds to 0 shares (dust rejected) |
 | `UnauthorizedCallback` | Flash loan callback from non-Morpho |
 
@@ -110,7 +109,7 @@ When collateral value ≤ debt, the vault is "underwater" and `totalAssets()` re
 | `previewDeposit()` | Returns 0 |
 | `convertToShares()` | Returns 0 |
 | `deposit()` | Reverts `ZeroNAV` |
-| `redeem()` | Reverts `ZeroNAV` |
+| `redeem()` | Reverts during flash loan (insufficient USDT to repay) |
 | `rebalance(0)` | No-op (exits early) |
 
 **Recovery:** Wait for Morpho liquidation or inject external capital.
@@ -128,6 +127,7 @@ When collateral value ≤ debt, the vault is "underwater" and `totalAssets()` re
 | Keeper failure | Multiple keepers via AccessControl |
 | Morpho liquidity | Monitor utilization off-chain |
 | PSM fee changes | See "PSM Fee Assumption" below |
+| Morpho exploit via approval | Morpho Blue is immutable (see "Approval Security" below) |
 
 ### PSM Fee Assumption
 
@@ -165,6 +165,30 @@ This assumption is used in:
 The vault does NOT explicitly check tin/tout values — reverts are a consequence of incorrect assumptions, not explicit guards. This is acceptable because:
 1. Reverts are fail-safe (no fund loss)
 2. Adding explicit checks would increase code complexity for a low-probability scenario
+
+### Approval Security
+
+> **Design Decision:** The vault grants unlimited token approval to Morpho Blue in constructor.
+
+```solidity
+IERC20(USDT).forceApprove(MORPHO, type(uint256).max);
+IERC20(SUSDD).forceApprove(MORPHO, type(uint256).max);
+```
+
+**Why this is safe for Morpho Blue:**
+
+| Property | Morpho Blue |
+|----------|-------------|
+| Upgradeable? | ❌ No — immutable singleton, no proxy |
+| Admin keys? | ❌ No owner, no governance |
+| Token pulling | Only on explicit calls (`repay`, `supplyCollateral`, flash loan) |
+
+**Why not per-operation approval:**
+- +25-45k gas per operation
+- Flash loan requires approval BEFORE callback executes
+- Morpho Blue's immutability makes unlimited approval safe
+
+See [ADR-004](adr/ADR-004-atomic-leverage.md#why-unlimited-approval-is-safe-for-morpho-blue) for detailed rationale.
 
 ### Implementation Notes
 
