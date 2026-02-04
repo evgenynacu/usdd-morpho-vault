@@ -162,6 +162,31 @@ describe("SUSDDVault Unit Tests", function () {
       expect(await vault.hasRole(await vault.MANAGER_ROLE(), manager.address)).to.be.true;
     });
 
+    it("should accept IDLE_MODE as targetLTV", async function () {
+      const VaultFactory = await ethers.getContractFactory("SUSDDVault");
+      const IDLE_MODE = ethers.MaxUint256;
+      const idleVault = await VaultFactory.deploy(
+        admin.address,
+        admin.address,
+        IDLE_MODE,
+        1000,
+        ethers.parseUnits("1000000", 6)
+      );
+      expect(await idleVault.targetLTV()).to.equal(IDLE_MODE);
+    });
+
+    it("should accept 0 as targetLTV (unleveraged mode)", async function () {
+      const VaultFactory = await ethers.getContractFactory("SUSDDVault");
+      const unleveragedVault = await VaultFactory.deploy(
+        admin.address,
+        admin.address,
+        0,
+        1000,
+        ethers.parseUnits("1000000", 6)
+      );
+      expect(await unleveragedVault.targetLTV()).to.equal(0);
+    });
+
     it("should revert with invalid LTV (> 90%)", async function () {
       const VaultFactory = await ethers.getContractFactory("SUSDDVault");
       await expect(
@@ -329,6 +354,17 @@ describe("SUSDDVault Unit Tests", function () {
       await expect(
         vault.connect(keeper).rebalance(ethers.parseEther("0.86"))
       ).to.be.revertedWithCustomError(vault, "LTVExceedsLLTV");
+    });
+
+    it("should accept IDLE_MODE in rebalance", async function () {
+      const IDLE_MODE = ethers.MaxUint256;
+      await vault.connect(keeper).rebalance(IDLE_MODE);
+      expect(await vault.targetLTV()).to.equal(IDLE_MODE);
+    });
+
+    it("should accept 0 in rebalance (unleveraged mode)", async function () {
+      await vault.connect(keeper).rebalance(0);
+      expect(await vault.targetLTV()).to.equal(0);
     });
   });
 

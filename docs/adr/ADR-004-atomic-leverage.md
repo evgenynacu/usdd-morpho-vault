@@ -8,17 +8,25 @@ How do we achieve leverage atomically in a single transaction?
 
 ## Flash Loan Operation Types
 
-The vault uses three operation types in flash loan callbacks:
+The vault uses four operation types in flash loan callbacks:
 
-| Op Code | Name | Purpose |
-|---------|------|---------|
-| 1 | `OP_DEPOSIT` | Build leveraged position from user deposit |
-| 2 | `OP_WITHDRAW` | Unwind position for user withdrawal |
-| 3 | `OP_REBALANCE` | Adjust leverage (lever up or delever) |
+| Op Code | Name | Parameters | Purpose |
+|---------|------|------------|---------|
+| 1 | `OP_DEPOSIT` | `uint256 depositedUsdt` | Build leveraged position from user deposit |
+| 2 | `OP_WITHDRAW` | `uint256 sharesToRepay, uint256 collateralToWithdraw` | Unwind position for user withdrawal |
+| 3 | `OP_LEVER_UP` | (none) | Increase leverage (borrow more, add collateral) |
+| 4 | `OP_DELEVER` | `bool withdrawAllCollateral` | Reduce leverage or exit position |
+
+**OP_DELEVER** handles three scenarios via `withdrawAllCollateral` flag and auto-detection:
+- **Partial delever** (`withdrawAllCollateral=false`, partial debt): Repay by assets, withdraw only enough collateral for flash loan
+- **Full exit to IDLE_MODE** (`withdrawAllCollateral=true`): Repay by shares (no dust), withdraw ALL collateral
+- **Transition to LTV=0** (`withdrawAllCollateral=false`, full debt): Auto-detects full repayment, uses by-shares, keeps remaining collateral
 
 ## Flow: Deposit (Build Leverage)
 
-> **Note:** Flash loan is only used when `targetLTV > 0` and `borrowAmount > 0`. When `targetLTV = 0`, deposits stay as idle USDT without flash loan.
+> **Note:** Flash loan is only used when `targetLTV > 0` and `borrowAmount > 0`.
+> - When `targetLTV = IDLE_MODE`: deposits stay as idle USDT (no flash loan)
+> - When `targetLTV = 0`: deposits convert to sUSDD collateral directly (no flash loan)
 
 ```
 User deposits USDT (when targetLTV > 0)
@@ -49,25 +57,28 @@ Result: Leveraged sUSDD position
 
 ## Flow: Withdraw (Unwind Leverage)
 
+> **Note:** Only `redeem(shares)` is supported. `withdraw(assets)` is disabled (see ADR-005).
+
 ```
-User requests withdrawal (X USDT)
+User calls redeem(shares)
     │
     ▼
-Calculate withdrawal ratio = X / NAV
+Calculate withdrawal ratio = shares / totalSupply
     │
     ▼
 ┌─────────────────────────────────────────────┐
-│ Proportionally withdraw:                    │
+│ Proportionally calculate:                   │
 │   - idleToWithdraw = idle * ratio           │
-│   - positionToUnwind = position * ratio     │
+│   - sharesToRepay = borrowShares * ratio    │
+│   - collateralToWithdraw = collateral * ratio│
 └─────────────────────────────────────────────┘
     │
-    ▼ (if positionToUnwind > 0)
+    ▼ (if sharesToRepay > 0 AND collateralToWithdraw > 0)
 ┌─────────────────────────────────────────────┐
 │ Flash loan USDT from Morpho (OP_WITHDRAW)   │
 │   │                                         │
 │   ▼                                         │
-│ Repay proportional USDT debt                │
+│ Repay debt by shares (exact, no dust)       │
 │   │                                         │
 │   ▼                                         │
 │ Withdraw proportional sUSDD collateral      │
@@ -85,6 +96,12 @@ Transfer USDT to user (idleToWithdraw + unwind proceeds)
 
 **Proportional Fairness:** Both idle USDT and position are withdrawn in the same ratio. This ensures all users pay similar gas/fees regardless of withdrawal order. See "Proportional Withdrawal" section below for details.
 
+**Micro-redemption Edge Cases:** Position unwind is skipped when:
+- `sharesToRepay > 0` but `collateralToWithdraw == 0` (can't repay flash loan)
+- `sharesToRepay == 0` but debt exists (protects remaining LTV)
+
+In these cases, user receives only their idle USDT portion. If no debt exists (`borrowShares == 0`), collateral withdrawal proceeds normally.
+
 ## Flow: Rebalance (Lever Up)
 
 ```
@@ -92,10 +109,10 @@ Keeper calls rebalance(higherLTV)
     │
     ▼
 ┌─────────────────────────────────────────────┐
-│ Flash loan USDT from Morpho (OP_REBALANCE)  │
+│ Flash loan USDT from Morpho (OP_LEVER_UP)   │
 │   │                                         │
 │   ▼                                         │
-│ Swap USDT → sUSDD                           │
+│ Swap all USDT → sUSDD (flash loan + idle)   │
 │   │                                         │
 │   ▼                                         │
 │ Supply sUSDD as additional collateral       │
@@ -105,14 +122,16 @@ Keeper calls rebalance(higherLTV)
 └─────────────────────────────────────────────┘
 ```
 
+> **Note:** Lever up also deploys any idle USDT into the position.
+
 ## Flow: Rebalance (Delever)
 
 ```
-Keeper calls rebalance(lowerLTV)
+Keeper calls rebalance(lowerLTV) where lowerLTV > 0
     │
     ▼
 ┌─────────────────────────────────────────────┐
-│ Flash loan USDT from Morpho (OP_REBALANCE)  │
+│ Flash loan USDT from Morpho (OP_DELEVER)    │
 │   │                                         │
 │   ▼                                         │
 │ Repay portion of USDT debt                  │
@@ -131,6 +150,62 @@ Keeper calls rebalance(lowerLTV)
 │ Repay flash loan                            │
 └─────────────────────────────────────────────┘
 ```
+
+## Flow: Transition to Unleveraged (LTV = 0)
+
+```
+Keeper calls rebalance(0)
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ Flash loan USDT from Morpho (OP_DELEVER, keepCollateral)│
+│   │                                                     │
+│   ▼                                                     │
+│ Auto-detect full debt → repay by shares (no dust)       │
+│   │                                                     │
+│   ▼                                                     │
+│ Calculate sUSDD needed for flash loan repay + buffer    │
+│   │                                                     │
+│   ▼                                                     │
+│ Withdraw only that sUSDD (keep rest as collateral)      │
+│   │                                                     │
+│   ▼                                                     │
+│ Swap sUSDD → USDT                                       │
+│   │                                                     │
+│   ▼                                                     │
+│ Repay flash loan (excess becomes idle USDT)             │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+Convert any idle USDT to sUSDD collateral
+```
+
+**Result:** Position has sUSDD collateral, zero debt, earning sUSDD yield without leverage.
+
+## Flow: Exit to IDLE_MODE
+
+```
+Keeper calls rebalance(IDLE_MODE)
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│ Flash loan USDT from Morpho (OP_DELEVER)    │
+│   │                                         │
+│   ▼                                         │
+│ Repay ALL debt by shares                    │
+│   │                                         │
+│   ▼                                         │
+│ Withdraw ALL collateral                     │
+│   │                                         │
+│   ▼                                         │
+│ Swap sUSDD → USDT                           │
+│   │                                         │
+│   ▼                                         │
+│ Repay flash loan                            │
+└─────────────────────────────────────────────┘
+```
+
+**Result:** All assets converted to idle USDT, no position in Morpho.
 
 ## Flash Loan Mechanics
 
@@ -319,38 +394,69 @@ This approach:
 
 > **Note:** Delever uses a 0.1% buffer, but **withdrawal does not**. Withdrawal is purely proportional — the equity margin naturally covers any rounding.
 
+### Unified OP_DELEVER with Auto-Detection
+
+All delever scenarios use a single `OP_DELEVER` operation with two parameters:
+- `flashLoanAmount`: Amount of USDT to flash loan (equals debt to repay)
+- `withdrawAllCollateral`: Whether to withdraw ALL collateral (true) or just enough for flash loan (false)
+
+**Repayment strategy is auto-detected:**
+```solidity
+bool repayingAllDebt = flashLoanAmount >= actualDebt;
+if (repayingAllDebt) {
+    // Full repayment: use by-shares (no dust)
+    morpho.repay(marketParams, 0, pos.borrowShares, address(this), "");
+} else {
+    // Partial repayment: use by-assets
+    morpho.repay(marketParams, flashLoanAmount, 0, address(this), "");
+}
+```
+
 ### Partial Delever (rebalance to lower LTV)
 
-When reducing leverage but not fully exiting:
+Parameters: `OP_DELEVER, withdrawAllCollateral=false`
 
 1. Flash loan the amount of debt to repay
-2. Repay that debt to Morpho
+2. Auto-detect partial → repay by assets
 3. Calculate collateral needed: `previewSUSDDNeededForUSDT(flashLoanAmount)`
-4. Add 0.1% buffer for rounding: `collateral *= 10010 / 10000` (see `DELEVER_BUFFER_BPS`)
+4. Add 0.1% buffer for rounding (see `DELEVER_BUFFER_BPS`)
 5. Withdraw and convert collateral to repay flash loan
 
 This may leave small amounts of excess USDT as idle balance.
 
-### Full Delever (rebalance(0))
+### Full Delever (rebalance(IDLE_MODE))
 
-When fully exiting the leveraged position:
+Parameters: `OP_DELEVER, withdrawAllCollateral=true`
 
 1. Flash loan the ENTIRE debt amount
-2. Repay all debt to Morpho
-3. Withdraw ALL remaining collateral (not just enough for flash loan)
+2. Auto-detect full → repay by shares (no dust)
+3. Withdraw ALL remaining collateral
 4. Convert all collateral to USDT
 5. Repay flash loan, remainder becomes idle USDT
 
-The key difference: partial delever withdraws only what's needed for the flash loan, while full delever withdraws everything.
+### Transition to Unleveraged (rebalance(0))
 
-### Edge Case: Underwater Position
+Parameters: `OP_DELEVER, withdrawAllCollateral=false`
 
-If `totalAssets() == 0` (underwater: collateral value ≤ debt), `rebalance()` exits early:
+1. Flash loan the ENTIRE debt amount
+2. Auto-detect full → repay by shares (no dust)
+3. Withdraw only enough collateral to repay flash loan + buffer
+4. Keep remaining collateral as unleveraged sUSDD
+5. Convert any idle USDT to sUSDD collateral (done after flash loan)
+
+### Edge Case: Underwater Position (Rebalance)
+
+If `currentDebt > 0 && totalAssets() == 0` (underwater: idle + collateral value ≤ debt), `rebalance()` is a true no-op:
 
 ```solidity
-uint256 nav = totalAssets();
-if (nav == 0) return;  // Cannot rebalance underwater position
+if (currentDebt > 0 && totalAssets() == 0) {
+    return;  // No state change, no events
+}
 ```
+
+**Note:** This check only triggers when there's debt. An empty vault (no position, no idle) is NOT considered underwater and can have its targetLTV updated.
+
+> **Distinction:** Deposits use a different check (`totalSupply() > 0 && NAV == 0`) because they need to prevent division by zero when calculating shares. See ADR-003 for details.
 
 **Why this is correct:**
 

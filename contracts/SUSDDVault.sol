@@ -56,10 +56,17 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     uint256 private constant MAX_PERFORMANCE_FEE_BPS = 3000; // 30% max
     uint256 private constant MAX_LTV = 0.9e18; // 90% max (below LLTV)
 
+    /// @notice Special value for targetLTV meaning "idle USDT mode" (no position)
+    /// @dev When targetLTV = IDLE_MODE:
+    ///      - Deposits stay as idle USDT
+    ///      - rebalance(IDLE_MODE) converts everything to idle USDT
+    uint256 public constant IDLE_MODE = type(uint256).max;
+
     // Flash loan operation types
     uint8 private constant OP_DEPOSIT = 1;
     uint8 private constant OP_WITHDRAW = 2;
-    uint8 private constant OP_REBALANCE = 3;
+    uint8 private constant OP_LEVER_UP = 3;
+    uint8 private constant OP_DELEVER = 4;
 
     // ============ Events ============
 
@@ -106,9 +113,11 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         IMorpho morpho = IMorpho(Constants.MORPHO);
         marketParams = morpho.idToMarketParams(Id.wrap(Constants.MARKET_ID));
 
-        // Validate LTV against both MAX_LTV and market LLTV
-        if (_targetLTV > MAX_LTV) revert InvalidLTV();
-        if (_targetLTV >= marketParams.lltv) revert LTVExceedsLLTV();
+        // Validate LTV: allow IDLE_MODE, 0 (unleveraged sUSDD), or valid leverage ratio
+        if (_targetLTV != IDLE_MODE && _targetLTV != 0) {
+            if (_targetLTV > MAX_LTV) revert InvalidLTV();
+            if (_targetLTV >= marketParams.lltv) revert LTVExceedsLLTV();
+        }
 
         // Setup roles
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
@@ -256,8 +265,11 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         // 2. Transfer USDT from caller
         SafeERC20.safeTransferFrom(IERC20(Constants.USDT), caller, address(this), assets);
 
-        // 3. Build leveraged position if targetLTV > 0
-        if (targetLTV > 0 && assets > 0) {
+        // 3. Build position based on targetLTV mode
+        // IDLE_MODE: stay as idle USDT
+        // 0: convert to sUSDD without leverage (unleveraged yield)
+        // >0: build leveraged position
+        if (targetLTV != IDLE_MODE && assets > 0) {
             _buildPosition(assets);
         }
 
@@ -288,9 +300,15 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     /// @notice Estimate the NAV increase from depositing assets
     /// @dev Assumes PSM tin/tout = 0 (see requirements.md "PSM Fee Assumption")
     function _estimateDepositValue(uint256 assets) internal view returns (uint256) {
-        if (targetLTV == 0) {
-            // No leverage: USDT stays idle, value = assets
+        if (targetLTV == IDLE_MODE) {
+            // Idle mode: USDT stays idle, value = assets
             return assets;
+        }
+
+        if (targetLTV == 0) {
+            // Unleveraged sUSDD: convert to sUSDD, no borrowing
+            uint256 unleveragedSusdd = SwapHelper.previewSwapUSDTtoSUSDD(assets);
+            return SwapHelper.getUSDTValue(unleveragedSusdd);
         }
 
         // With leverage:
@@ -404,19 +422,22 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
             uint256 sharesToRepay = (uint256(pos.borrowShares) * withdrawRatio) / Constants.WAD;
             uint256 collateralToWithdraw = (uint256(pos.collateral) * withdrawRatio) / Constants.WAD;
 
-            if (sharesToRepay > 0) {
-                // Calculate flash loan amount from shares (with interest accrual)
+            if (sharesToRepay > 0 && collateralToWithdraw > 0) {
+                // Both debt and collateral to withdraw - use flash loan
                 (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
                 uint256 flashLoanAmount = sharesToRepay.toAssetsUp(totalBorrowAssets, totalBorrowShares);
 
-                // Flash loan to repay debt - pass sharesToRepay and collateralToWithdraw
                 bytes memory data = abi.encode(OP_WITHDRAW, sharesToRepay, collateralToWithdraw);
                 morpho.flashLoan(Constants.USDT, flashLoanAmount, data);
-            } else if (collateralToWithdraw > 0) {
-                // No debt, just withdraw collateral
+            } else if (collateralToWithdraw > 0 && pos.borrowShares == 0) {
+                // No debt at all, safe to just withdraw collateral
                 morpho.withdrawCollateral(marketParams, collateralToWithdraw, address(this), address(this));
                 SwapHelper.swapSUSDDtoUSDT(collateralToWithdraw);
             }
+            // Edge cases where we skip position unwind (user gets only idle portion):
+            // - sharesToRepay=0, collateralToWithdraw>0, debt exists → protects LTV
+            // - sharesToRepay>0, collateralToWithdraw=0 → can't repay flash loan without collateral
+            // - both round to 0 → nothing to unwind
         }
 
         // Transfer proportional idle + net gain from position unwind
@@ -452,70 +473,127 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     // ============ Rebalance (Keeper) ============
 
     /// @notice Rebalance the position to a new target LTV
-    /// @param newTargetLTV New LTV target (0 for full delever)
+    /// @dev targetLTV modes:
+    ///      - IDLE_MODE: Exit to idle USDT (withdraw all collateral, repay all debt)
+    ///      - 0: Unleveraged sUSDD (repay all debt, keep/build sUSDD collateral)
+    ///      - 1..MAX_LTV: Leveraged position
+    /// @param newTargetLTV New LTV target
     function rebalance(uint256 newTargetLTV) external onlyRole(KEEPER_ROLE) whenNotPaused nonReentrant {
-        if (newTargetLTV > MAX_LTV) revert InvalidLTV();
-        if (newTargetLTV >= marketParams.lltv) revert LTVExceedsLLTV();
+        // Validate LTV (allow IDLE_MODE, 0, or valid leverage ratio)
+        if (newTargetLTV != IDLE_MODE && newTargetLTV != 0) {
+            if (newTargetLTV > MAX_LTV) revert InvalidLTV();
+            if (newTargetLTV >= marketParams.lltv) revert LTVExceedsLLTV();
+        }
 
+        IMorpho morpho = IMorpho(Constants.MORPHO);
+        Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
+        uint256 currentDebt = morpho.expectedBorrowAssets(marketParams, address(this));
+
+        // Check for underwater position BEFORE updating state (true no-op)
+        // Underwater = idle + collateral value <= debt
+        if (currentDebt > 0 && totalAssets() == 0) {
+            // Underwater - cannot rebalance, don't change state
+            return;
+        }
+
+        // Update state only after underwater check passes
         uint256 oldTargetLTV = targetLTV;
         targetLTV = newTargetLTV;
 
         emit TargetLTVUpdated(oldTargetLTV, newTargetLTV);
 
-        // Get current position
-        IMorpho morpho = IMorpho(Constants.MORPHO);
-        Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
-
-        if (pos.collateral == 0 && newTargetLTV == 0) {
-            // No position and no target - nothing to do
+        // IDLE_MODE: Full exit to USDT
+        if (newTargetLTV == IDLE_MODE) {
+            _exitToIdleUsdt(pos, currentDebt);
+            emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
             return;
         }
 
-        // Calculate current NAV and position value
-        // Note: If nav == 0 (underwater: collateral + idle <= debt), we exit early.
-        // Underwater positions cannot be rebalanced - they will be liquidated by Morpho.
-        uint256 nav = totalAssets();
-        if (nav == 0) return;
-
-        // Calculate target debt for new LTV based on total NAV
-        // Any idle USDT will be deployed into the position during lever up
-        // targetDebt = nav * targetLTV / (1 - targetLTV)
-        uint256 targetDebt;
-        if (newTargetLTV > 0) {
-            targetDebt = (nav * newTargetLTV) / (Constants.WAD - newTargetLTV);
+        // LTV = 0: Unleveraged sUSDD mode
+        if (newTargetLTV == 0) {
+            _transitionToUnleveraged(pos, currentDebt);
+            emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
+            return;
         }
 
-        // Get current debt (including accrued interest)
-        uint256 currentDebt = morpho.expectedBorrowAssets(marketParams, address(this));
+        // LTV > 0: Leveraged mode
+        uint256 nav = totalAssets();
+        if (nav == 0) {
+            // Underwater or no assets - cannot rebalance
+            emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
+            return;
+        }
+
+        // Calculate target debt for new LTV
+        // targetDebt = nav * targetLTV / (1 - targetLTV)
+        uint256 targetDebt = (nav * newTargetLTV) / (Constants.WAD - newTargetLTV);
 
         if (targetDebt > currentDebt) {
-            // Lever up: borrow more, add collateral
-            // _leverUp now automatically deploys any idle USDT into the position
+            // Lever up: borrow more, add collateral (also deploys idle USDT)
             uint256 additionalDebt = targetDebt - currentDebt;
             _leverUp(additionalDebt);
         } else if (targetDebt < currentDebt) {
             // Delever: repay debt, remove collateral
             uint256 debtToRepay = currentDebt - targetDebt;
-            // If targetDebt == 0, this is a full delever - withdraw ALL collateral
-            bool isFullDelever = (targetDebt == 0);
-            _delever(debtToRepay, isFullDelever);
-        } else if (newTargetLTV == 0 && pos.collateral > 0) {
-            // Special case: targetDebt == currentDebt == 0, but we have collateral
-            // Full delever requested - withdraw all collateral to idle USDT
-            IMorpho(Constants.MORPHO).withdrawCollateral(marketParams, pos.collateral, address(this), address(this));
-            SwapHelper.swapSUSDDtoUSDT(pos.collateral);
+            _delever(debtToRepay, false);
         }
 
         emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
+    }
+
+    /// @notice Exit completely to idle USDT
+    function _exitToIdleUsdt(Position memory pos, uint256 currentDebt) internal {
+        if (currentDebt > 0) {
+            // Has debt - full delever (repay all, withdraw all)
+            _delever(currentDebt, true);
+        } else if (pos.collateral > 0) {
+            // No debt but has collateral - just withdraw and convert
+            IMorpho(Constants.MORPHO).withdrawCollateral(marketParams, pos.collateral, address(this), address(this));
+            SwapHelper.swapSUSDDtoUSDT(pos.collateral);
+        }
+        // else: already idle USDT, nothing to do
+    }
+
+    /// @notice Transition to unleveraged sUSDD (0% LTV)
+    /// @dev Repays all debt but keeps collateral as sUSDD
+    function _transitionToUnleveraged(Position memory, uint256 currentDebt) internal {
+        if (currentDebt > 0) {
+            // Repay all debt while keeping collateral
+            // _delever with withdrawAllCollateral=false will:
+            // - Auto-detect full debt repayment and use by-shares (no dust)
+            // - Withdraw only enough collateral to repay flash loan
+            _delever(currentDebt, false);
+        }
+
+        // Convert any idle USDT to sUSDD collateral
+        uint256 idleUsdt = IERC20(Constants.USDT).balanceOf(address(this));
+        if (idleUsdt > 0) {
+            uint256 susddAmount = SwapHelper.swapUSDTtoSUSDD(idleUsdt);
+            IMorpho(Constants.MORPHO).supplyCollateral(marketParams, susddAmount, address(this), "");
+        }
     }
 
     /// @notice Lever up: borrow more and add collateral
     function _leverUp(uint256 additionalDebt) internal {
         if (additionalDebt == 0) return;
 
-        // direction=1 for lever up, third param (withdrawAllCollateral) is false/unused for lever up
-        bytes memory data = abi.encode(OP_REBALANCE, uint256(1), false);
+        bytes memory data = abi.encode(OP_LEVER_UP);
         IMorpho(Constants.MORPHO).flashLoan(Constants.USDT, additionalDebt, data);
+    }
+
+    /// @notice Handle lever up flash loan callback
+    /// @param flashLoanAmount Amount of USDT flash loaned
+    function _handleLeverUpCallback(uint256 flashLoanAmount) internal {
+        // Convert all USDT to sUSDD and supply as collateral
+        // Note: balanceOf already includes flashLoanAmount (Morpho sent it before callback)
+        // So we just convert the entire balance (flash loan + any pre-existing idle)
+        uint256 totalUsdt = IERC20(Constants.USDT).balanceOf(address(this));
+
+        uint256 susddAmount = SwapHelper.swapUSDTtoSUSDD(totalUsdt);
+        IMorpho morpho = IMorpho(Constants.MORPHO);
+        morpho.supplyCollateral(marketParams, susddAmount, address(this), "");
+        // Borrow only flashLoanAmount to repay flash loan (pre-existing idle was already ours)
+        morpho.borrow(marketParams, flashLoanAmount, 0, address(this), address(this));
     }
 
     /// @notice Delever: repay debt and remove collateral
@@ -524,64 +602,54 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     function _delever(uint256 debtToRepay, bool withdrawAllCollateral) internal {
         if (debtToRepay == 0) return;
 
-        // direction=0 for delever, third param indicates if we should withdraw all collateral
-        bytes memory data = abi.encode(OP_REBALANCE, uint256(0), withdrawAllCollateral);
+        bytes memory data = abi.encode(OP_DELEVER, withdrawAllCollateral);
         IMorpho(Constants.MORPHO).flashLoan(Constants.USDT, debtToRepay, data);
     }
 
-    /// @notice Handle rebalance flash loan callback
+    /// @notice Handle delever flash loan callback
     /// @param flashLoanAmount Amount of USDT flash loaned
-    /// @param direction 1 = lever up, 0 = delever
-    /// @param withdrawAllCollateral If true and delever, withdraw ALL collateral (for full delever)
-    function _handleRebalanceCallback(uint256 flashLoanAmount, uint256 direction, bool withdrawAllCollateral) internal {
+    /// @param withdrawAllCollateral If true, withdraw ALL collateral (for IDLE_MODE exit)
+    function _handleDeleverCallback(uint256 flashLoanAmount, bool withdrawAllCollateral) internal {
         IMorpho morpho = IMorpho(Constants.MORPHO);
+        Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
 
-        if (direction == 1) {
-            // Lever up: convert all USDT to sUSDD and supply as collateral
-            // Note: balanceOf already includes flashLoanAmount (Morpho sent it before callback)
-            // So we just convert the entire balance (flash loan + any pre-existing idle)
-            uint256 totalUsdt = IERC20(Constants.USDT).balanceOf(address(this));
+        // Determine if we're repaying all debt (use by-shares for clean repayment)
+        uint256 actualDebt = morpho.expectedBorrowAssets(marketParams, address(this));
+        bool repayingAllDebt = flashLoanAmount >= actualDebt;
 
-            uint256 susddAmount = SwapHelper.swapUSDTtoSUSDD(totalUsdt);
-            morpho.supplyCollateral(marketParams, susddAmount, address(this), "");
-            // Borrow only flashLoanAmount to repay flash loan (pre-existing idle was already ours)
-            morpho.borrow(marketParams, flashLoanAmount, 0, address(this), address(this));
-        } else {
-            // Delever: repay debt, withdraw collateral, convert to USDT
-            Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
-
-            uint256 collateralToWithdraw;
-            if (withdrawAllCollateral) {
-                // Full delever: repay ALL borrow shares to clear debt completely
-                // This avoids leaving tiny dust that would make position unhealthy
-                if (pos.borrowShares > 0) {
-                    morpho.repay(marketParams, 0, pos.borrowShares, address(this), "");
-                }
-                collateralToWithdraw = pos.collateral;
+        // Repay debt
+        if (pos.borrowShares > 0) {
+            if (repayingAllDebt) {
+                // Full debt repayment: use by-shares to avoid dust
+                morpho.repay(marketParams, 0, pos.borrowShares, address(this), "");
             } else {
-                // Partial delever: repay by assets
-                uint256 actualDebt = morpho.expectedBorrowAssets(marketParams, address(this));
-                uint256 repayAmount = flashLoanAmount > actualDebt ? actualDebt : flashLoanAmount;
-                if (repayAmount > 0) {
-                    morpho.repay(marketParams, repayAmount, 0, address(this), "");
-                }
-                // Re-read position
-                pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
-                // Calculate how much collateral to withdraw
-                // We need to withdraw enough sUSDD to get `flashLoanAmount` USDT after fees
-                collateralToWithdraw = SwapHelper.previewSUSDDNeededForUSDT(flashLoanAmount);
-                // Add buffer for sUSDD rate accrual and rounding (10 bps = 0.1%)
-                collateralToWithdraw = (collateralToWithdraw * (Constants.BPS_DENOMINATOR + Constants.DELEVER_BUFFER_BPS)) / Constants.BPS_DENOMINATOR;
-
-                if (collateralToWithdraw > pos.collateral) {
-                    collateralToWithdraw = pos.collateral;
-                }
+                // Partial repayment: use by-assets
+                morpho.repay(marketParams, flashLoanAmount, 0, address(this), "");
             }
+        }
 
-            if (collateralToWithdraw > 0) {
-                morpho.withdrawCollateral(marketParams, collateralToWithdraw, address(this), address(this));
-                SwapHelper.swapSUSDDtoUSDT(collateralToWithdraw);
+        // Determine collateral to withdraw
+        uint256 collateralToWithdraw;
+        if (withdrawAllCollateral) {
+            // IDLE_MODE: withdraw everything
+            collateralToWithdraw = pos.collateral;
+        } else {
+            // Keep collateral: withdraw only enough to repay flash loan
+            collateralToWithdraw = SwapHelper.previewSUSDDNeededForUSDT(flashLoanAmount);
+            // Add buffer for sUSDD rate accrual and rounding (10 bps = 0.1%)
+            collateralToWithdraw = (collateralToWithdraw * (Constants.BPS_DENOMINATOR + Constants.DELEVER_BUFFER_BPS)) / Constants.BPS_DENOMINATOR;
+
+            // Re-read position after repay to get current collateral
+            pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
+            if (collateralToWithdraw > pos.collateral) {
+                collateralToWithdraw = pos.collateral;
             }
+        }
+
+        // Withdraw and swap collateral
+        if (collateralToWithdraw > 0) {
+            morpho.withdrawCollateral(marketParams, collateralToWithdraw, address(this), address(this));
+            SwapHelper.swapSUSDDtoUSDT(collateralToWithdraw);
         }
     }
 
@@ -639,10 +707,11 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         if (feeShares > 0) {
             _mint(feeRecipient, feeShares);
             emit PerformanceFeeHarvested(feeShares, feeRecipient);
-        }
 
-        // Update high water mark
-        highWaterMark = currentValuePerShare;
+            // Update high water mark only when fees are actually harvested
+            // This preserves small profits for future harvests instead of losing them to rounding
+            highWaterMark = currentValuePerShare;
+        }
     }
 
     // ============ Pauser Functions ============
@@ -663,7 +732,6 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     function onMorphoFlashLoan(uint256 assets, bytes calldata data) external override {
         if (msg.sender != Constants.MORPHO) revert UnauthorizedCallback();
 
-        // First decode operation type
         uint8 operation = abi.decode(data, (uint8));
 
         if (operation == OP_DEPOSIT) {
@@ -672,9 +740,11 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         } else if (operation == OP_WITHDRAW) {
             (, uint256 sharesToRepay, uint256 collateralToWithdraw) = abi.decode(data, (uint8, uint256, uint256));
             _handleWithdrawCallback(sharesToRepay, collateralToWithdraw);
-        } else if (operation == OP_REBALANCE) {
-            (, uint256 direction, bool withdrawAllCollateral) = abi.decode(data, (uint8, uint256, bool));
-            _handleRebalanceCallback(assets, direction, withdrawAllCollateral);
+        } else if (operation == OP_LEVER_UP) {
+            _handleLeverUpCallback(assets);
+        } else if (operation == OP_DELEVER) {
+            (, bool withdrawAllCollateral) = abi.decode(data, (uint8, bool));
+            _handleDeleverCallback(assets, withdrawAllCollateral);
         } else {
             revert FlashLoanCallbackFailed();
         }

@@ -10,7 +10,7 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 2. Vault creates leveraged sUSDD position in **Morpho Blue** (sUSDD collateral, USDT debt)
 3. Vault earns amplified sUSDD yield minus borrowing costs
 
-> **Note:** When `targetLTV = 0`, deposits stay as idle USDT without leverage. See section 4.1.1.
+> **Note:** When `targetLTV = IDLE_MODE`, deposits stay as idle USDT. When `targetLTV = 0`, deposits convert to unleveraged sUSDD. See section 4.1.1.
 
 ### 1.3 Key Properties
 - **No AMM slippage** on sUSDD/USDT conversion (uses PSM + ERC4626)
@@ -36,15 +36,22 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 | **Keeper** | rebalance (lever/delever) |
 | **Manager** | update fees, set fee recipient, set max TVL, harvest fees |
 | **Pauser** | pause/unpause |
-| **Admin** | grant/revoke roles, pause (for emergency: rebalance(0) THEN pause) |
+| **Admin** | grant/revoke roles, pause (for emergency: rebalance(IDLE_MODE) THEN pause) |
 
 ---
 
 ## 4. Strategy Requirements
 
 ### 4.1 Leverage Mechanism
-- When `targetLTV > 0`: each deposit builds a leveraged position via flash loan
-- When `targetLTV = 0`: deposits stay as idle USDT (see section 4.1.1)
+
+The vault supports three operating modes based on `targetLTV`:
+
+| Mode | targetLTV Value | Deposit Behavior | Yield |
+|------|-----------------|------------------|-------|
+| **IDLE_MODE** | `type(uint256).max` | Stay as idle USDT | None |
+| **Unleveraged** | `0` | Convert to sUSDD collateral (no debt) | sUSDD yield |
+| **Leveraged** | `1..MAX_LTV` | Build leveraged sUSDD position | Amplified sUSDD yield |
+
 - **Deposit shares**: calculated using **Delta NAV** — shares represent actual value added after PSM fees (protects existing holders from dilution)
 - **Withdrawals**: use **proportional** approach — both idle USDT and position are withdrawn in the same ratio (fairness-first design)
 
@@ -53,18 +60,32 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 - Final position: ~4000 USDT worth of sUSDD collateral, ~3000 USDT debt
 - Net equity: 1000 USDT
 
-### 4.1.1 No-Leverage Mode (targetLTV = 0)
+### 4.1.1 Operating Modes
 
-When `targetLTV = 0`:
+**IDLE_MODE (`type(uint256).max`):**
 - Deposits stay as **idle USDT** (no position built, no flash loan)
-- **No sUSDD yield** is earned — deposits remain in USDT
-- Useful for emergency pause of leverage without pausing user deposits
-- Re-levering via `rebalance(newLTV)` deploys all idle USDT into a new position
+- **No yield** is earned — deposits remain in USDT
+- Useful for emergency pause of all strategy exposure
+- Re-entering any other mode via `rebalance()` deploys idle USDT
+
+**Unleveraged Mode (`targetLTV = 0`):**
+- Deposits convert to **sUSDD collateral** in Morpho (no borrowing)
+- Earns **sUSDD staking yield** without leverage
+- Useful when carry trade is unprofitable but sUSDD yield is still desired
+- Transitioning to/from leveraged mode via `rebalance()` adjusts position
+
+**Leveraged Mode (`targetLTV > 0`):**
+- Deposits build **leveraged sUSDD position** (collateral + debt)
+- Earns **amplified sUSDD yield** minus borrowing costs
+- Target LTV must be below both MAX_LTV (90%) and market LLTV
 
 ### 4.2 Rebalancing
 - Keeper monitors LTV and adjusts position via `rebalance(targetLTV)`
 - Keeper monitors borrowRate vs sUSDD yield
-- Keeper delevers (`rebalance(0)`) if strategy becomes unprofitable
+- Mode transitions via `rebalance()`:
+  - `rebalance(IDLE_MODE)` → Exit to idle USDT (emergency)
+  - `rebalance(0)` → Unleveraged sUSDD (when carry trade unprofitable)
+  - `rebalance(newLTV)` → Adjust leverage ratio
 - LTV is validated against both MAX_LTV (90%) and market LLTV
 
 ### 4.3 Performance Fee
@@ -78,11 +99,12 @@ When `targetLTV = 0`:
 
 | Parameter | Description | Example | Constraints |
 |-----------|-------------|---------|-------------|
-| `targetLTV` | Target leverage ratio | 0.75e18 (75%) | < MAX_LTV and < market LLTV |
+| `targetLTV` | Target leverage mode | 0.75e18 (75%) | IDLE_MODE, 0, or < MAX_LTV and < LLTV |
 | `performanceFeeBps` | Fee on profits (bps) | 1000 (10%) | Max 3000 (30%) |
 | `maxTotalAssets` | Vault TVL cap | 10M USDT | - |
 | `feeRecipient` | Address receiving fees | - | Non-zero |
 | `highWaterMark` | NAV/share threshold | 1e18 | Auto-updated |
+| `IDLE_MODE` | Constant for idle mode | `type(uint256).max` | Immutable constant |
 
 ---
 
@@ -95,13 +117,28 @@ When `targetLTV = 0`:
 | `InvalidFee` | performanceFeeBps > 30% |
 | `InvalidRecipient` | feeRecipient is zero address |
 | `MaxTotalAssetsExceeded` | Deposit would exceed TVL cap |
-| `ZeroNAV` | NAV is zero on deposit (underwater position) |
+| `ZeroNAV` | NAV is zero on deposit (shares exist but NAV=0) |
 | `DepositTooSmall` | Deposit rounds to 0 shares (dust rejected) |
 | `UnauthorizedCallback` | Flash loan callback from non-Morpho |
 
-### Underwater Position (NAV = 0)
+### ZeroNAV vs Underwater
 
-When collateral value ≤ debt, the vault is "underwater" and `totalAssets()` returns 0.
+The vault distinguishes between two related but different conditions:
+
+| Condition | Definition | Check |
+|-----------|------------|-------|
+| **ZeroNAV** | NAV=0 while shares exist | `totalSupply() > 0 && totalAssets() == 0` |
+| **Underwater** | Debt exceeds collateral value | `currentDebt > 0 && totalAssets() == 0` |
+
+**ZeroNAV** is broader — it includes underwater positions AND the rare case where sUSDD depegs to 0 without debt.
+
+**Why different checks?**
+- **Deposits** check `totalSupply() > 0` because `shares = value * supply / NAV` would divide by zero
+- **Rebalance** checks `currentDebt > 0` because delevering requires debt to repay
+
+### ZeroNAV Behavior (for deposits)
+
+When `totalAssets() == 0` and `totalSupply() > 0`:
 
 | Operation | Behavior |
 |-----------|----------|
@@ -109,10 +146,41 @@ When collateral value ≤ debt, the vault is "underwater" and `totalAssets()` re
 | `previewDeposit()` | Returns 0 |
 | `convertToShares()` | Returns 0 |
 | `deposit()` | Reverts `ZeroNAV` |
+
+### Underwater Behavior (for rebalance)
+
+When `currentDebt > 0` and `totalAssets() == 0`:
+
+| Operation | Behavior |
+|-----------|----------|
+| `rebalance(*)` | True no-op (no state change, no events) |
 | `redeem()` | Reverts during flash loan (insufficient USDT to repay) |
-| `rebalance(0)` | No-op (exits early) |
+
+**Note:** An empty vault (no position, no shares) can still have its `targetLTV` updated via `rebalance()`.
 
 **Recovery:** Wait for Morpho liquidation or inject external capital.
+
+### Tiny Redemption Edge Cases
+
+For extremely small redemptions, rounding can cause edge cases:
+
+| Scenario | sharesToRepay | collateralToWithdraw | Behavior |
+|----------|---------------|---------------------|----------|
+| Normal | > 0 | > 0 | Full proportional unwind via flash loan |
+| Both zero | 0 | 0 | User gets only idle portion |
+| Collateral only | 0 | > 0 (debt exists) | **Skip** - protects remaining LTV |
+| Debt only | > 0 | 0 | **Skip** - can't repay flash loan without collateral |
+
+In skip scenarios, user receives only their proportional share of idle USDT. This protects remaining depositors from micro-redemptions that would harm the position.
+
+### Tiny Deposit Edge Case
+
+For extremely small deposits in leveraged mode (`targetLTV > 0`), if `borrowAmount` rounds to 0:
+- Deposit becomes **unleveraged** (sUSDD collateral only, no debt)
+- This prevents reverts on micro-deposits
+- User still receives shares proportional to value added
+
+This is intentional: reverting on tiny deposits would harm UX, and the "unleveraged" fallback is safe.
 
 ---
 
@@ -121,8 +189,8 @@ When collateral value ≤ debt, the vault is "underwater" and `totalAssets()` re
 | Risk | Mitigation |
 |------|------------|
 | Vault vulnerability | Audits, bug bounty |
-| sUSDD depeg | Emergency delever via `rebalance(0)` |
-| High borrow rates | Keeper delevers when unprofitable |
+| sUSDD depeg | Emergency exit via `rebalance(IDLE_MODE)` |
+| High borrow rates | Keeper switches to `rebalance(0)` (unleveraged) or `IDLE_MODE` |
 | Liquidation | Conservative LTV, rebalance buffer, LLTV validation |
 | Keeper failure | Multiple keepers via AccessControl |
 | Morpho liquidity | Monitor utilization off-chain |
@@ -150,10 +218,13 @@ This assumption is used in:
 
 | Operation | Behavior | Risk |
 |-----------|----------|------|
-| Deposit | May work (overpays slightly) | Low |
-| Withdraw | Reverts (insufficient USDT) | None (fail-safe) |
+| `previewDeposit()` | Returns inaccurate estimate | Low (informational only) |
+| `deposit()` | May work (overpays slightly) | Low |
+| `withdraw()` | Reverts (insufficient USDT) | None (fail-safe) |
 | Delever | Reverts (insufficient USDT) | None (fail-safe) |
 | Funds | Safe in Morpho | None |
+
+> **Note:** Preview functions (`previewDeposit`, `convertToShares`) may become inaccurate if PSM fees are enabled, but deposits may still succeed. Integrators should not rely on preview accuracy if PSM fees change.
 
 **Resolution path:** Deploy upgraded contract with fee handling, migrate users.
 

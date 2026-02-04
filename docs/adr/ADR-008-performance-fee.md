@@ -8,13 +8,14 @@ How do we accrue and calculate performance fees?
 
 ## Mechanism
 
-1. Track `highWaterMark` (highest NAV per share achieved)
+1. Track `highWaterMark` (highest NAV per share at which fees were harvested)
 2. Manager calls `harvestFees()` to realize fees:
    - If current NAV/share > highWaterMark:
      - Calculate profit = (currentNAV/share - highWaterMark) × totalSupply
      - Fee = profit × performanceFeeBps / 10000
      - Mint new shares to feeRecipient worth `fee` amount
-     - Update highWaterMark = currentNAV/share
+     - **Only if feeShares > 0**: Update highWaterMark = currentNAV/share
+   - If feeShares rounds to 0, HWM is NOT updated (preserves small profits for future harvest)
 
 ## Harvest Trigger
 

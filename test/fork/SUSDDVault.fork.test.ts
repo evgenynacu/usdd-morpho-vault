@@ -216,12 +216,35 @@ describe("SUSDDVault Fork Tests", function () {
       expect(diffFromTarget).to.be.lt(ethers.parseUnits("0.1", 18));
     });
 
-    it("should full delever (LTV=0) and convert to idle USDT", async function () {
+    it("should transition to unleveraged sUSDD (LTV=0)", async function () {
       const posBefore = await getPosition(await vault.getAddress());
       expect(posBefore.collateral).to.be.gt(0);
       expect(posBefore.debt).to.be.gt(0);
 
       await vault.connect(keeper).rebalance(0);
+
+      const posAfter = await getPosition(await vault.getAddress());
+      const usdt = await ethers.getContractAt("IERC20", ADDRESSES.USDT);
+      const idleUsdt = await usdt.balanceOf(await vault.getAddress());
+
+      // Debt should be cleared but collateral mostly remains (minus what was used for flash loan repayment)
+      expect(posAfter.debt).to.be.lt(ethers.parseUnits("1", DECIMALS.USDT));
+      // Collateral should still exist (we kept it, only withdrew enough to repay flash loan)
+      expect(posAfter.collateral).to.be.gt(ethers.parseUnits("500", 18));
+
+      // Very little idle USDT (just buffer excess)
+      expect(idleUsdt).to.be.lt(ethers.parseUnits("50", DECIMALS.USDT));
+      console.log(`Collateral after LTV=0: ${ethers.formatUnits(posAfter.collateral, 18)} sUSDD`);
+    });
+
+    it("should full delever to IDLE_MODE", async function () {
+      const posBefore = await getPosition(await vault.getAddress());
+      expect(posBefore.collateral).to.be.gt(0);
+      expect(posBefore.debt).to.be.gt(0);
+
+      // IDLE_MODE = type(uint256).max
+      const IDLE_MODE = ethers.MaxUint256;
+      await vault.connect(keeper).rebalance(IDLE_MODE);
 
       const posAfter = await getPosition(await vault.getAddress());
       const usdt = await ethers.getContractAt("IERC20", ADDRESSES.USDT);
@@ -237,8 +260,9 @@ describe("SUSDDVault Fork Tests", function () {
     });
 
     it("should re-lever from idle USDT", async function () {
-      // First delever
-      await vault.connect(keeper).rebalance(0);
+      // First exit to IDLE_MODE
+      const IDLE_MODE = ethers.MaxUint256;
+      await vault.connect(keeper).rebalance(IDLE_MODE);
 
       const usdt = await ethers.getContractAt("IERC20", ADDRESSES.USDT);
       const idleUsdtBefore = await usdt.balanceOf(await vault.getAddress());
