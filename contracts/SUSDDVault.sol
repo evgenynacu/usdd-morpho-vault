@@ -74,13 +74,12 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
     event PerformanceFeeUpdated(uint256 oldFee, uint256 newFee);
     event FeeRecipientUpdated(address oldRecipient, address newRecipient);
     event MaxTotalAssetsUpdated(uint256 oldMax, uint256 newMax);
-    /// @notice Emitted after rebalance completes
-    /// @param oldLTV Previous target LTV setting
-    /// @param newLTV New target LTV setting
-    /// @param collateralBefore Collateral amount BEFORE rebalance operation
-    /// @param debtBefore Debt amount BEFORE rebalance operation
     event Rebalanced(uint256 oldLTV, uint256 newLTV, uint256 collateralBefore, uint256 debtBefore);
-    event PerformanceFeeHarvested(uint256 feeShares, address recipient);
+    event PerformanceFeeAccrued(uint256 feeShares, address indexed recipient);
+
+    /// @notice Vault state snapshot for Dune dashboard tracking
+    /// @dev Emitted after deposit, redeem, rebalance, harvestFees
+    event VaultSnapshot(uint256 totalAssets, uint256 totalSupply, uint256 pricePerShare, uint256 timestamp);
 
     // ============ Errors ============
 
@@ -252,9 +251,8 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         nonReentrant
         whenNotPaused
     {
-        // 1. Snapshot state BEFORE (cache to avoid duplicate SLOAD)
-        uint256 navBefore = totalAssets();
-        uint256 supplyBefore = totalSupply();
+        // 0. Accrue performance fee before deposit (returns cached nav/supply)
+        (uint256 navBefore, uint256 supplyBefore) = _accruePerformanceFee();
 
         if (assets + navBefore > maxTotalAssets) revert MaxTotalAssetsExceeded();
 
@@ -295,6 +293,7 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         _mint(receiver, actualShares);
 
         emit Deposit(caller, receiver, assets, actualShares);
+        _emitSnapshot(navAfter, supplyBefore + actualShares);
     }
 
     /// @notice Estimate the NAV increase from depositing assets
@@ -379,6 +378,9 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         nonReentrant
         returns (uint256)
     {
+        // Accrue performance fee before withdrawal (returns cached supply)
+        (, uint256 supplyBefore) = _accruePerformanceFee();
+
         uint256 maxShares = maxRedeem(owner);
         if (shares > maxShares) {
             revert ERC4626ExceededMaxRedeem(owner, shares, maxShares);
@@ -390,7 +392,6 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         }
 
         // Calculate withdrawal ratio BEFORE burning (shares-based, no NAV needed)
-        uint256 supplyBefore = totalSupply();
         uint256 withdrawRatio = (shares * Constants.WAD) / supplyBefore;
 
         // Burn shares
@@ -400,6 +401,7 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         uint256 assets = _unwindPosition(withdrawRatio, receiver);
 
         emit Withdraw(caller, receiver, owner, assets, shares);
+        _emitSnapshot(totalAssets(), supplyBefore - shares);
 
         return assets;
     }
@@ -485,13 +487,17 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
             if (newTargetLTV >= marketParams.lltv) revert LTVExceedsLLTV();
         }
 
+        // Accrue fee and cache nav/supply
+        (uint256 navCached, uint256 supply) = _accruePerformanceFee();
+
         IMorpho morpho = IMorpho(Constants.MORPHO);
         Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
-        uint256 currentDebt = morpho.expectedBorrowAssets(marketParams, address(this));
+        uint256 debtBefore = morpho.expectedBorrowAssets(marketParams, address(this));
+        uint256 collateralBefore = pos.collateral;
 
         // Check for underwater position BEFORE updating state (true no-op)
         // Underwater = idle + collateral value <= debt
-        if (currentDebt > 0 && totalAssets() == 0) {
+        if (debtBefore > 0 && navCached == 0) {
             // Underwater - cannot rebalance, don't change state
             return;
         }
@@ -504,41 +510,44 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
 
         // IDLE_MODE: Full exit to USDT
         if (newTargetLTV == IDLE_MODE) {
-            _exitToIdleUsdt(pos, currentDebt);
-            emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
+            _exitToIdleUsdt(pos, debtBefore);
+            emit Rebalanced(oldTargetLTV, newTargetLTV, collateralBefore, debtBefore);
+            _emitSnapshot(totalAssets(), supply);
             return;
         }
 
         // LTV = 0: Unleveraged sUSDD mode
         if (newTargetLTV == 0) {
-            _transitionToUnleveraged(pos, currentDebt);
-            emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
+            _transitionToUnleveraged(pos, debtBefore);
+            emit Rebalanced(oldTargetLTV, newTargetLTV, collateralBefore, debtBefore);
+            _emitSnapshot(totalAssets(), supply);
             return;
         }
 
         // LTV > 0: Leveraged mode
-        uint256 nav = totalAssets();
-        if (nav == 0) {
+        if (navCached == 0) {
             // Underwater or no assets - cannot rebalance
-            emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
+            emit Rebalanced(oldTargetLTV, newTargetLTV, collateralBefore, debtBefore);
+            _emitSnapshot(navCached, supply);
             return;
         }
 
         // Calculate target debt for new LTV
         // targetDebt = nav * targetLTV / (1 - targetLTV)
-        uint256 targetDebt = (nav * newTargetLTV) / (Constants.WAD - newTargetLTV);
+        uint256 targetDebt = (navCached * newTargetLTV) / (Constants.WAD - newTargetLTV);
 
-        if (targetDebt > currentDebt) {
+        if (targetDebt > debtBefore) {
             // Lever up: borrow more, add collateral (also deploys idle USDT)
-            uint256 additionalDebt = targetDebt - currentDebt;
+            uint256 additionalDebt = targetDebt - debtBefore;
             _leverUp(additionalDebt);
-        } else if (targetDebt < currentDebt) {
+        } else if (targetDebt < debtBefore) {
             // Delever: repay debt, remove collateral
-            uint256 debtToRepay = currentDebt - targetDebt;
+            uint256 debtToRepay = debtBefore - targetDebt;
             _delever(debtToRepay, false);
         }
 
-        emit Rebalanced(oldTargetLTV, newTargetLTV, pos.collateral, currentDebt);
+        emit Rebalanced(oldTargetLTV, newTargetLTV, collateralBefore, debtBefore);
+        _emitSnapshot(totalAssets(), supply);
     }
 
     /// @notice Exit completely to idle USDT
@@ -678,40 +687,44 @@ contract SUSDDVault is ERC4626, AccessControl, Pausable, ReentrancyGuard, IMorph
         emit MaxTotalAssetsUpdated(oldMax, newMax);
     }
 
-    /// @notice Harvest performance fees
-    /// @dev Mints new shares to feeRecipient based on profit above high water mark
-    function harvestFees() external onlyRole(MANAGER_ROLE) nonReentrant {
-        // Cache totalSupply to avoid multiple SLOAD operations
-        uint256 supply = totalSupply();
-        if (performanceFeeBps == 0 || supply == 0) return;
+    /// @notice Accrue fees + emit heartbeat for tracking
+    /// @dev Keeper should call periodically (daily) even without deposits/withdraws
+    function harvestFees() external onlyRole(KEEPER_ROLE) nonReentrant {
+        (uint256 nav, uint256 supply) = _accruePerformanceFee();
+        _emitSnapshot(nav, supply);
+    }
 
-        // Calculate current value per share (in WAD)
-        uint256 nav = totalAssets();
-        uint256 currentValuePerShare = (nav * 1e18) / supply;
+    /// @notice Internal function to accrue performance fees
+    /// @dev Called in deposit/redeem for continuous fee accrual
+    /// @return nav Current NAV
+    /// @return supply Current supply AFTER any fee mint
+    function _accruePerformanceFee() internal returns (uint256 nav, uint256 supply) {
+        supply = totalSupply();
+        nav = totalAssets();
 
-        if (currentValuePerShare <= highWaterMark) {
-            // No profit above HWM
-            return;
-        }
+        if (performanceFeeBps == 0 || supply == 0) return (nav, supply);
 
-        // Calculate profit per share
-        uint256 profitPerShare = currentValuePerShare - highWaterMark;
+        uint256 currentPPS = (nav * 1e18) / supply;
+        if (currentPPS <= highWaterMark) return (nav, supply);
 
-        // Calculate fee per share
+        uint256 profitPerShare = currentPPS - highWaterMark;
         uint256 feePerShare = (profitPerShare * performanceFeeBps) / MAX_BPS;
-
-        // Calculate fee shares to mint
-        // feeShares = totalSupply * feePerShare / (currentValuePerShare - feePerShare)
-        uint256 feeShares = (supply * feePerShare) / (currentValuePerShare - feePerShare);
+        uint256 feeShares = (supply * feePerShare) / (currentPPS - feePerShare);
 
         if (feeShares > 0) {
             _mint(feeRecipient, feeShares);
-            emit PerformanceFeeHarvested(feeShares, feeRecipient);
-
-            // Update high water mark only when fees are actually harvested
-            // This preserves small profits for future harvests instead of losing them to rounding
-            highWaterMark = currentValuePerShare;
+            supply += feeShares;
+            highWaterMark = currentPPS;
+            emit PerformanceFeeAccrued(feeShares, feeRecipient);
         }
+
+        return (nav, supply);
+    }
+
+    /// @notice Emit VaultSnapshot with provided state (saves gas by avoiding re-reads)
+    function _emitSnapshot(uint256 nav, uint256 supply) internal {
+        uint256 pps = supply > 0 ? (nav * 1e18) / supply : 1e18;
+        emit VaultSnapshot(nav, supply, pps, block.timestamp);
     }
 
     // ============ Pauser Functions ============
