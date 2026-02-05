@@ -9,9 +9,9 @@ async function main() {
   const config = {
     admin: deployer.address,
     feeRecipient: deployer.address, // Change for production
-    targetLTV: ethers.parseUnits("0.75", 18), // 75%
-    performanceFeeBps: 1000n, // 10%
-    maxTotalAssets: ethers.parseUnits("10000000", 6), // 10M USDT
+    targetLTV: ethers.parseUnits("0.9", 18), // 75%
+    performanceFeeBps: 0n, // 0%
+    maxTotalAssets: ethers.parseUnits("500000", 6), // 500k USDT
   };
 
   console.log("\nDeployment Configuration:");
@@ -72,6 +72,13 @@ async function main() {
   console.log("  Oracle:", marketParams.oracle);
   console.log("  IRM:", marketParams.irm);
   console.log("  LLTV:", ethers.formatUnits(marketParams.lltv, 16) + "%");
+
+  // Add admin to whitelist
+  console.log("\nAdding admin to whitelist...");
+  const whitelistTx = await vault.addToWhitelist(config.admin);
+  await whitelistTx.wait();
+  console.log("  Admin whitelisted:", await vault.whitelisted(config.admin));
+  console.log("  Whitelist enabled:", await vault.whitelistEnabled());
 
   console.log("\n=== Deployment Complete ===");
   console.log("Proxy Address:", proxyAddress);
