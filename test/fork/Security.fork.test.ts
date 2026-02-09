@@ -949,4 +949,149 @@ describe("Security Tests - Protecting Existing Users", function () {
       console.log("\n✓ Skip branches protect remaining users - Bob's value preserved");
     });
   });
+
+  // ============================================================
+  // 11. UPGRADE AUTHORIZATION
+  // ============================================================
+  describe("Upgrade Authorization", function () {
+    /**
+     * Test UUPS upgrade authorization:
+     * - Only DEFAULT_ADMIN_ROLE can authorize upgrades
+     * - Non-admins should revert when trying to upgrade
+     */
+
+    beforeEach(async function () {
+      await deployVault();
+    });
+
+    it("admin can upgrade the contract", async function () {
+      const vaultAddress = await vault.getAddress();
+      const oldImpl = await upgrades.erc1967.getImplementationAddress(vaultAddress);
+
+      // Deploy new implementation via admin
+      const VaultFactory = await ethers.getContractFactory("SUSDDVault", admin);
+
+      // This should complete without revert
+      const upgraded = await upgrades.upgradeProxy(vaultAddress, VaultFactory);
+      await upgraded.waitForDeployment();
+
+      const newImpl = await upgrades.erc1967.getImplementationAddress(vaultAddress);
+
+      // Verify vault still works after upgrade
+      const targetLTV = await vault.targetLTV();
+      expect(targetLTV).to.equal(TARGET_LTV);
+
+      // Verify the contract at proxy address is functional
+      const vaultName = await vault.name();
+      expect(vaultName).to.equal("Leveraged sUSDD Vault");
+
+      console.log("✓ Admin successfully upgraded the contract");
+      console.log(`  Old implementation: ${oldImpl}`);
+      console.log(`  New implementation: ${newImpl}`);
+      console.log(`  (Same address if code unchanged - expected behavior)`);
+    });
+
+    it("non-admin cannot upgrade the contract", async function () {
+      const vaultAddress = await vault.getAddress();
+
+      // Attacker tries to upgrade
+      const VaultFactory = await ethers.getContractFactory("SUSDDVault", attacker);
+
+      await expect(
+        upgrades.upgradeProxy(vaultAddress, VaultFactory)
+      ).to.be.revertedWithCustomError(vault, "AccessControlUnauthorizedAccount");
+
+      console.log("✓ Non-admin correctly rejected from upgrading");
+    });
+
+    it("keeper cannot upgrade the contract", async function () {
+      const vaultAddress = await vault.getAddress();
+
+      // Keeper has KEEPER_ROLE but not DEFAULT_ADMIN_ROLE
+      const VaultFactory = await ethers.getContractFactory("SUSDDVault", keeper);
+
+      await expect(
+        upgrades.upgradeProxy(vaultAddress, VaultFactory)
+      ).to.be.revertedWithCustomError(vault, "AccessControlUnauthorizedAccount");
+
+      console.log("✓ Keeper correctly rejected from upgrading");
+    });
+
+    it("state is preserved after upgrade", async function () {
+      // First, deposit some funds to have state
+      const depositAmount = ethers.parseUnits("1000", DECIMALS.USDT);
+      await fundWithUSDT(alice.address, depositAmount);
+
+      // Add alice to whitelist
+      await vault.connect(admin).addToWhitelist(alice.address);
+
+      const usdt = await ethers.getContractAt("IERC20", ADDRESSES.USDT);
+      await usdt.connect(alice).approve(await vault.getAddress(), depositAmount);
+      await vault.connect(alice).deposit(depositAmount, alice.address);
+
+      // Record state before upgrade
+      const totalAssetsBefore = await vault.totalAssets();
+      const totalSupplyBefore = await vault.totalSupply();
+      const aliceSharesBefore = await vault.balanceOf(alice.address);
+      const targetLTVBefore = await vault.targetLTV();
+      const whitelistEnabledBefore = await vault.whitelistEnabled();
+
+      // Upgrade
+      const vaultAddress = await vault.getAddress();
+      const VaultFactory = await ethers.getContractFactory("SUSDDVault", admin);
+      await upgrades.upgradeProxy(vaultAddress, VaultFactory);
+
+      // Verify state is preserved (allow small tolerance for interest accrual between blocks)
+      const totalAssetsAfter = await vault.totalAssets();
+      const tolerance = totalAssetsBefore / 1000n; // 0.1% tolerance for interest
+      expect(totalAssetsAfter).to.be.gte(totalAssetsBefore - tolerance);
+      expect(totalAssetsAfter).to.be.lte(totalAssetsBefore + tolerance);
+      expect(await vault.totalSupply()).to.equal(totalSupplyBefore);
+      expect(await vault.balanceOf(alice.address)).to.equal(aliceSharesBefore);
+      expect(await vault.targetLTV()).to.equal(targetLTVBefore);
+      expect(await vault.whitelistEnabled()).to.equal(whitelistEnabledBefore);
+
+      console.log("✓ State preserved after upgrade");
+      console.log(`  totalAssets: ${ethers.formatUnits(totalAssetsBefore, 6)} USDT`);
+      console.log(`  totalSupply: ${ethers.formatUnits(totalSupplyBefore, 18)} shares`);
+      console.log(`  Alice shares: ${ethers.formatUnits(aliceSharesBefore, 18)}`);
+    });
+
+    it("upgraded vault functions work correctly", async function () {
+      // Deposit before upgrade
+      const depositAmount = ethers.parseUnits("1000", DECIMALS.USDT);
+      await fundWithUSDT(alice.address, depositAmount);
+
+      // Add alice to whitelist
+      await vault.connect(admin).addToWhitelist(alice.address);
+
+      const usdt = await ethers.getContractAt("IERC20", ADDRESSES.USDT);
+      await usdt.connect(alice).approve(await vault.getAddress(), depositAmount);
+      await vault.connect(alice).deposit(depositAmount, alice.address);
+
+      // Upgrade
+      const vaultAddress = await vault.getAddress();
+      const VaultFactory = await ethers.getContractFactory("SUSDDVault", admin);
+      await upgrades.upgradeProxy(vaultAddress, VaultFactory);
+
+      // Test getCurrentLTV (added in recent upgrade)
+      const currentLTV = await vault.getCurrentLTV();
+      expect(currentLTV).to.be.gt(0);
+
+      // Test redeem still works
+      const aliceShares = await vault.balanceOf(alice.address);
+      const halfShares = aliceShares / 2n;
+
+      const balanceBefore = await usdt.balanceOf(alice.address);
+      await vault.connect(alice).redeem(halfShares, alice.address, alice.address);
+      const balanceAfter = await usdt.balanceOf(alice.address);
+
+      expect(balanceAfter).to.be.gt(balanceBefore);
+
+      console.log("✓ Upgraded vault functions work correctly");
+      console.log(`  getCurrentLTV: ${ethers.formatUnits(currentLTV, 16)}%`);
+      console.log(`  Redeemed: ${ethers.formatUnits(halfShares, 18)} shares`);
+      console.log(`  Received: ${ethers.formatUnits(balanceAfter - balanceBefore, 6)} USDT`);
+    });
+  });
 });

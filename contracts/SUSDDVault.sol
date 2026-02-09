@@ -860,6 +860,25 @@ contract SUSDDVault is
         // IMPORTANT: Do NOT call forceApprove here — it would overwrite infinite approval
     }
 
+    // ============ View Helpers ============
+
+    /// @notice Get current LTV of the position
+    /// @return ltv Current LTV in WAD (1e18 = 100%), or 0 if no position
+    function getCurrentLTV() external view returns (uint256 ltv) {
+        IMorpho morpho = IMorpho(Constants.MORPHO);
+        Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
+
+        if (pos.collateral == 0) return 0;
+
+        uint256 collateralValue = SwapHelper.getUSDTValue(pos.collateral);
+        if (collateralValue == 0) return 0;
+
+        uint256 debt = morpho.expectedBorrowAssets(marketParams, address(this));
+
+        // LTV = debt / collateralValue (in WAD)
+        ltv = (debt * Constants.WAD) / collateralValue;
+    }
+
     // ============ Upgrade Authorization ============
 
     /// @notice Authorize upgrade to new implementation
