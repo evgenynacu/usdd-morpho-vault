@@ -536,14 +536,14 @@ describe("SUSDDVault Unit Tests", function () {
       const shares = ethers.parseUnits("100", 6);
       await expect(
         vault.connect(user1).mint(shares, user1.address)
-      ).to.be.revertedWith("mint() not supported, use deposit()");
+      ).to.be.revertedWithCustomError(vault, "NotSupported");
     });
 
     it("should revert on withdraw() - not supported", async function () {
       const assets = ethers.parseUnits("100", 6);
       await expect(
         vault.connect(user1).withdraw(assets, user1.address, user1.address)
-      ).to.be.revertedWith("withdraw() not supported, use redeem()");
+      ).to.be.revertedWithCustomError(vault, "NotSupported");
     });
 
     it("should return 0 for maxMint and maxWithdraw", async function () {
@@ -834,8 +834,8 @@ describe("SUSDDVault Unit Tests", function () {
       const feeRecipientSharesBefore = await vault.balanceOf(admin.address);
 
       // Harvest - should not mint additional shares (no profit above HWM)
-      // Use admin who has MANAGER_ROLE from initialize
-      await vault.connect(admin).harvestFees();
+      // Use admin who has KEEPER_ROLE from initialize
+      await vault.connect(admin).claimRewards("0x");
 
       const totalSupplyAfter = await vault.totalSupply();
       const feeRecipientSharesAfter = await vault.balanceOf(admin.address);
@@ -851,9 +851,183 @@ describe("SUSDDVault Unit Tests", function () {
       await vault.connect(admin).setPerformanceFee(0);
 
       // Even if there's profit simulation, no fees should be collected
-      await vault.connect(admin).harvestFees();
+      await vault.connect(admin).claimRewards("0x");
 
       // Just checking it doesn't revert
+    });
+  });
+
+  describe("Merkl Rewards", function () {
+    let merklDistributor: any;
+
+    beforeEach(async function () {
+      // Deploy mock Merkl distributor
+      const MockMerklFactory = await ethers.getContractFactory("MockMerklDistributor");
+      merklDistributor = await MockMerklFactory.deploy(ADDRESSES.USDD);
+      await merklDistributor.waitForDeployment();
+
+      // Set merkl distributor in vault
+      await vault.connect(admin).setMerklDistributor(await merklDistributor.getAddress());
+
+      // Give USDD to merkl distributor for rewards
+      await usdd.mint(await merklDistributor.getAddress(), ethers.parseEther("10000"));
+    });
+
+    describe("setMerklDistributor", function () {
+      it("should allow admin to set merkl distributor", async function () {
+        const newDistributor = user1.address;
+        await expect(vault.connect(admin).setMerklDistributor(newDistributor))
+          .to.emit(vault, "MerklDistributorUpdated")
+          .withArgs(await merklDistributor.getAddress(), newDistributor);
+
+        expect(await vault.merklDistributor()).to.equal(newDistributor);
+      });
+
+      it("should revert if non-admin tries to set merkl distributor", async function () {
+        await expect(
+          vault.connect(keeper).setMerklDistributor(user1.address)
+        ).to.be.revertedWithCustomError(vault, "AccessControlUnauthorizedAccount");
+      });
+
+      it("should revert if setting zero address", async function () {
+        await expect(
+          vault.connect(admin).setMerklDistributor(ethers.ZeroAddress)
+        ).to.be.revertedWithCustomError(vault, "InvalidMerklDistributor");
+      });
+    });
+
+    describe("claimRewards", function () {
+      it("should work as heartbeat with empty claimData (no merkl needed)", async function () {
+        // Deploy fresh vault without merkl set
+        const VaultFactory = await ethers.getContractFactory("SUSDDVault");
+        const freshVault = await upgrades.deployProxy(
+          VaultFactory,
+          [admin.address, admin.address, WAD * 75n / 100n, 1000, ethers.parseUnits("10000000", 6)],
+          { kind: "uups" }
+        ) as unknown as SUSDDVault;
+
+        // Should work without merkl distributor set - just emits snapshot
+        await expect(freshVault.connect(admin).claimRewards("0x"))
+          .to.emit(freshVault, "VaultSnapshot");
+      });
+
+      it("should revert if merkl distributor not set but claimData provided", async function () {
+        // Deploy fresh vault without merkl set
+        const VaultFactory = await ethers.getContractFactory("SUSDDVault");
+        const freshVault = await upgrades.deployProxy(
+          VaultFactory,
+          [admin.address, admin.address, WAD * 75n / 100n, 1000, ethers.parseUnits("10000000", 6)],
+          { kind: "uups" }
+        ) as unknown as SUSDDVault;
+
+        await freshVault.connect(admin).grantRole(await freshVault.KEEPER_ROLE(), keeper.address);
+
+        const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
+        await expect(
+          freshVault.connect(keeper).claimRewards(claimData)
+        ).to.be.revertedWithCustomError(freshVault, "InvalidMerklDistributor");
+      });
+
+      it("should revert if merkl claim fails", async function () {
+        await merklDistributor.setShouldFail(true);
+
+        const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
+        await expect(
+          vault.connect(keeper).claimRewards(claimData)
+        ).to.be.revertedWithCustomError(vault, "MerklClaimFailed");
+      });
+
+      it("should revert if no rewards received", async function () {
+        // Set reward to 0
+        await merklDistributor.setRewardAmount(0);
+
+        const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
+        await expect(
+          vault.connect(keeper).claimRewards(claimData)
+        ).to.be.revertedWithCustomError(vault, "NoRewardsReceived");
+      });
+
+      it("should convert to USDT when in IDLE_MODE", async function () {
+        // Set vault to IDLE_MODE
+        await vault.connect(keeper).rebalance(ethers.MaxUint256);
+        expect(await vault.targetLTV()).to.equal(ethers.MaxUint256);
+
+        // Set reward amount
+        const rewardAmount = ethers.parseEther("100"); // 100 USDD
+        await merklDistributor.setRewardAmount(rewardAmount);
+
+        // Claim rewards
+        const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
+        const usdtBefore = await usdt.balanceOf(await vault.getAddress());
+
+        await expect(vault.connect(keeper).claimRewards(claimData))
+          .to.emit(vault, "RewardsClaimed")
+          .withArgs(rewardAmount);
+
+        // Should have USDT (converted from USDD)
+        const usdtAfter = await usdt.balanceOf(await vault.getAddress());
+        expect(usdtAfter).to.be.gt(usdtBefore);
+      });
+
+      it("should add to collateral when targetLTV > 0", async function () {
+        // Ensure leveraged mode (default)
+        expect(await vault.targetLTV()).to.equal(WAD * 75n / 100n);
+
+        // Set reward amount
+        const rewardAmount = ethers.parseEther("100"); // 100 USDD
+        await merklDistributor.setRewardAmount(rewardAmount);
+
+        // Get collateral before
+        const posBefore = await morpho.position(MARKET_ID, await vault.getAddress());
+
+        // Claim rewards
+        const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
+        await expect(vault.connect(keeper).claimRewards(claimData))
+          .to.emit(vault, "RewardsClaimed")
+          .withArgs(rewardAmount);
+
+        // Collateral should increase (sUSDD added)
+        const posAfter = await morpho.position(MARKET_ID, await vault.getAddress());
+        expect(posAfter.collateral).to.be.gt(posBefore.collateral);
+      });
+
+      it("should add to collateral when targetLTV = 0 (unleveraged)", async function () {
+        // Set vault to unleveraged sUSDD mode
+        await vault.connect(keeper).rebalance(0);
+        expect(await vault.targetLTV()).to.equal(0);
+
+        // Set reward amount
+        const rewardAmount = ethers.parseEther("100"); // 100 USDD
+        await merklDistributor.setRewardAmount(rewardAmount);
+
+        // Get collateral before
+        const posBefore = await morpho.position(MARKET_ID, await vault.getAddress());
+
+        // Claim rewards
+        const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
+        await vault.connect(keeper).claimRewards(claimData);
+
+        // Collateral should increase
+        const posAfter = await morpho.position(MARKET_ID, await vault.getAddress());
+        expect(posAfter.collateral).to.be.gt(posBefore.collateral);
+      });
+
+      it("should only allow KEEPER_ROLE to claim", async function () {
+        await merklDistributor.setRewardAmount(ethers.parseEther("100"));
+        const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
+
+        await expect(
+          vault.connect(user1).claimRewards(claimData)
+        ).to.be.revertedWithCustomError(vault, "AccessControlUnauthorizedAccount");
+      });
+
+      it("should emit VaultSnapshot after claiming", async function () {
+        await merklDistributor.setRewardAmount(ethers.parseEther("100"));
+        const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
+
+        await expect(vault.connect(keeper).claimRewards(claimData))
+          .to.emit(vault, "VaultSnapshot");
+      });
     });
   });
 

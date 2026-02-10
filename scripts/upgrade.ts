@@ -30,11 +30,6 @@ async function main() {
   const newImpl = await upgrades.erc1967.getImplementationAddress(proxyAddress);
   console.log("New implementation:", newImpl);
 
-  // Verify upgrade worked by calling new function
-  console.log("\nVerifying new function...");
-  const currentLTV = await vault.getCurrentLTV();
-  console.log("getCurrentLTV():", ethers.formatUnits(currentLTV, 16) + "%");
-
   // Also check existing state is preserved
   console.log("\nVerifying state preservation...");
   console.log("  totalAssets:", ethers.formatUnits(await vault.totalAssets(), 6), "USDT");

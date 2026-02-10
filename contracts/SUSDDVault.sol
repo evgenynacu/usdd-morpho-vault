@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
@@ -68,8 +69,13 @@ contract SUSDDVault is
     /// @notice Addresses allowed when whitelist is enabled
     mapping(address => bool) public whitelisted;
 
+    // ============ Merkl Rewards ============
+
+    /// @notice Merkl distributor contract address
+    address public merklDistributor;
+
     /// @notice Storage gap for future upgrades
-    uint256[48] private __gap;
+    uint256[47] private __gap;
 
     // ============ Constants ============
 
@@ -100,6 +106,8 @@ contract SUSDDVault is
     event WhitelistEnabledUpdated(bool enabled);
     event AddedToWhitelist(address indexed account);
     event RemovedFromWhitelist(address indexed account);
+    event MerklDistributorUpdated(address oldDistributor, address newDistributor);
+    event RewardsClaimed(uint256 usddReceived);
 
     /// @notice Vault state snapshot for Dune dashboard tracking
     /// @dev Emitted after deposit, redeem, rebalance, harvestFees
@@ -118,6 +126,10 @@ contract SUSDDVault is
     error DepositTooSmall();
     error NotWhitelisted(address account);
     error InvalidAdmin();
+    error InvalidMerklDistributor();
+    error NoRewardsReceived();
+    error MerklClaimFailed();
+    error NotSupported();
 
     // ============ Constructor & Initializer ============
 
@@ -282,17 +294,14 @@ contract SUSDDVault is
 
     /// @notice Mint is not supported - use deposit() instead
     /// @dev Delta NAV approach makes exact share minting impractical.
-    ///      User cannot predict exact shares they'll receive because shares
-    ///      depend on actual NAV change after position is built.
     function mint(uint256, address) public pure override returns (uint256) {
-        revert("mint() not supported, use deposit()");
+        revert NotSupported();
     }
 
     /// @notice Withdraw is not supported - use redeem() instead
     /// @dev With proportional withdrawal, specifying exact assets is impractical.
-    ///      User should redeem shares and receive proportional USDT.
     function withdraw(uint256, address, address) public pure override returns (uint256) {
-        revert("withdraw() not supported, use redeem()");
+        revert NotSupported();
     }
 
     // ============ Deposit ============
@@ -780,11 +789,59 @@ contract SUSDDVault is
         }
     }
 
-    /// @notice Accrue fees + emit heartbeat for tracking
-    /// @dev Keeper should call periodically (daily) even without deposits/withdraws
-    function harvestFees() external onlyRole(KEEPER_ROLE) nonReentrant {
-        (uint256 nav, uint256 supply) = _accruePerformanceFee();
-        _emitSnapshot(nav, supply);
+    // ============ Merkl Rewards ============
+
+    /// @notice Set Merkl distributor address
+    /// @dev Only admin can change this
+    function setMerklDistributor(address _merklDistributor) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_merklDistributor == address(0)) revert InvalidMerklDistributor();
+        address oldDistributor = merklDistributor;
+        merklDistributor = _merklDistributor;
+        emit MerklDistributorUpdated(oldDistributor, _merklDistributor);
+    }
+
+    /// @notice Claim USDD rewards from Merkl and/or harvest fees
+    /// @dev If claimData is empty: just accrue fees + emit snapshot (heartbeat)
+    ///      If claimData is provided: claim rewards, reinvest, emit snapshot
+    ///      Reinvest logic depends on targetLTV:
+    ///      - IDLE_MODE: USDD → USDT (PSM), leave as idle
+    ///      - 0 or >0: USDD → sUSDD (stake), add to collateral (compounds yield)
+    /// @param claimData Encoded call data for Merkl distributor (empty for heartbeat only)
+    function claimRewards(bytes calldata claimData) external onlyRole(KEEPER_ROLE) nonReentrant {
+        // 1. Accrue fees first
+        (, uint256 supply) = _accruePerformanceFee();
+
+        // 2. If claimData provided, claim from Merkl and reinvest
+        if (claimData.length > 0) {
+            if (merklDistributor == address(0)) revert InvalidMerklDistributor();
+
+            // Check USDD balance before claim
+            uint256 usddBefore = IERC20(Constants.USDD).balanceOf(address(this));
+
+            // Call Merkl to claim rewards
+            (bool success,) = merklDistributor.call(claimData);
+            if (!success) revert MerklClaimFailed();
+
+            // Check USDD balance after - must have increased
+            uint256 usddAfter = IERC20(Constants.USDD).balanceOf(address(this));
+            if (usddAfter <= usddBefore) revert NoRewardsReceived();
+            uint256 usddReceived = usddAfter - usddBefore;
+
+            // Reinvest based on targetLTV mode
+            if (targetLTV == IDLE_MODE) {
+                // IDLE_MODE: convert to USDT and leave as idle
+                SwapHelper.swapUSDDtoUSDT(usddReceived);
+            } else {
+                // Leveraged or unleveraged sUSDD: stake and add to collateral
+                IERC20(Constants.USDD).forceApprove(Constants.SUSDD, usddReceived);
+                uint256 susddAmount = IERC4626(Constants.SUSDD).deposit(usddReceived, address(this));
+                IMorpho(Constants.MORPHO).supplyCollateral(marketParams, susddAmount, address(this), "");
+            }
+
+            emit RewardsClaimed(usddReceived);
+        }
+
+        _emitSnapshot(totalAssets(), supply);
     }
 
     /// @notice Internal function to accrue performance fees
@@ -858,25 +915,6 @@ contract SUSDDVault is
         // Flash loan repayment: Morpho calls safeTransferFrom to pull back `assets`
         // Approval was set in constructor (infinite approve to Morpho)
         // IMPORTANT: Do NOT call forceApprove here — it would overwrite infinite approval
-    }
-
-    // ============ View Helpers ============
-
-    /// @notice Get current LTV of the position
-    /// @return ltv Current LTV in WAD (1e18 = 100%), or 0 if no position
-    function getCurrentLTV() external view returns (uint256 ltv) {
-        IMorpho morpho = IMorpho(Constants.MORPHO);
-        Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
-
-        if (pos.collateral == 0) return 0;
-
-        uint256 collateralValue = SwapHelper.getUSDTValue(pos.collateral);
-        if (collateralValue == 0) return 0;
-
-        uint256 debt = morpho.expectedBorrowAssets(marketParams, address(this));
-
-        // LTV = debt / collateralValue (in WAD)
-        ltv = (debt * Constants.WAD) / collateralValue;
     }
 
     // ============ Upgrade Authorization ============

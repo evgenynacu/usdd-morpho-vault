@@ -92,6 +92,27 @@ library SwapHelper {
         usdtValue = usddValue / 1e12;
     }
 
+    /// @notice Swap USDD to USDT via PSM (direct, without sUSDD)
+    /// @param usddAmount Amount of USDD to swap (18 decimals)
+    /// @return usdtAmount Amount of USDT received (6 decimals)
+    function swapUSDDtoUSDT(uint256 usddAmount) internal returns (uint256 usdtAmount) {
+        if (usddAmount == 0) return 0;
+
+        IERC20 usdt = IERC20(Constants.USDT);
+        IERC20 usdd = IERC20(Constants.USDD);
+        IPSM psm = IPSM(Constants.PSM);
+
+        // USDD -> USDT via PSM
+        usdd.forceApprove(Constants.PSM, usddAmount);
+
+        // When tout=0: gemAmt = usddAmount (scaled to 6 decimals)
+        uint256 gemAmt = usddAmount / 1e12;
+
+        uint256 usdtBalanceBefore = usdt.balanceOf(address(this));
+        psm.buyGem(address(this), gemAmt);
+        usdtAmount = usdt.balanceOf(address(this)) - usdtBalanceBefore;
+    }
+
     /// @notice Preview sUSDD amount for USDT deposit
     /// @param usdtAmount Amount of USDT (6 decimals)
     /// @return susddAmount Expected sUSDD amount (18 decimals)
