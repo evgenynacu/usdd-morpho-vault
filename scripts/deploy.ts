@@ -5,13 +5,15 @@ async function main() {
   console.log("Deploying contracts with account:", deployer.address);
   console.log("Account balance:", ethers.formatEther(await ethers.provider.getBalance(deployer.address)), "ETH");
 
-  // Configuration - adjust these for your deployment
+  // Configuration - override with env vars:
+  // LTV=0.9 FEE=1000 CAP=500000 WHITELIST=false npx hardhat run scripts/deploy.ts --network mainnet
   const config = {
-    admin: deployer.address,
-    feeRecipient: deployer.address, // Change for production
-    targetLTV: ethers.parseUnits("0.9", 18), // 75%
-    performanceFeeBps: 0n, // 0%
-    maxTotalAssets: ethers.parseUnits("500000", 6), // 500k USDT
+    admin: process.env.ADMIN || deployer.address,
+    feeRecipient: process.env.FEE_RECIPIENT || deployer.address,
+    targetLTV: ethers.parseUnits(process.env.LTV || "0.9", 18),
+    performanceFeeBps: BigInt(process.env.FEE || "0"),
+    maxTotalAssets: ethers.parseUnits(process.env.CAP || "500000", 6),
+    whitelistEnabled: (process.env.WHITELIST ?? "true") !== "false",
   };
 
   console.log("\nDeployment Configuration:");
@@ -73,11 +75,17 @@ async function main() {
   console.log("  IRM:", marketParams.irm);
   console.log("  LLTV:", ethers.formatUnits(marketParams.lltv, 16) + "%");
 
-  // Add admin to whitelist
-  console.log("\nAdding admin to whitelist...");
-  const whitelistTx = await vault.addToWhitelist(config.admin);
-  await whitelistTx.wait();
-  console.log("  Admin whitelisted:", await vault.whitelisted(config.admin));
+  // Whitelist setup
+  if (config.whitelistEnabled) {
+    console.log("\nAdding admin to whitelist...");
+    const whitelistTx = await vault.addToWhitelist(config.admin);
+    await whitelistTx.wait();
+    console.log("  Admin whitelisted:", await vault.whitelisted(config.admin));
+  } else {
+    console.log("\nDisabling whitelist...");
+    const disableTx = await vault.setWhitelistEnabled(false);
+    await disableTx.wait();
+  }
   console.log("  Whitelist enabled:", await vault.whitelistEnabled());
 
   console.log("\n=== Deployment Complete ===");
