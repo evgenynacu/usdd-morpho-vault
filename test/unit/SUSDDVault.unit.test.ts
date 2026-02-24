@@ -187,12 +187,12 @@ describe("SUSDDVault Unit Tests", function () {
       expect(await unleveragedVault.targetLTV()).to.equal(0);
     });
 
-    it("should revert with invalid LTV (> 90%)", async function () {
+    it("should revert with invalid LTV (> 91.5%)", async function () {
       const VaultFactory = await ethers.getContractFactory("SUSDDVault");
       await expect(
         upgrades.deployProxy(
           VaultFactory,
-          [admin.address, admin.address, ethers.parseEther("0.91"), 1000, ethers.parseUnits("1000000", 6)],
+          [admin.address, admin.address, ethers.parseEther("0.916"), 1000, ethers.parseUnits("1000000", 6)],
           { kind: "uups" }
         )
       ).to.be.revertedWithCustomError(vault, "InvalidLTV");
@@ -384,9 +384,9 @@ describe("SUSDDVault Unit Tests", function () {
       ).to.be.revertedWithCustomError(vault, "EnforcedPause");
     });
 
-    it("should revert if LTV too high (> 90%)", async function () {
+    it("should revert if LTV too high (> 91.5%)", async function () {
       await expect(
-        vault.connect(keeper).rebalance(ethers.parseEther("0.91"))
+        vault.connect(keeper).rebalance(ethers.parseEther("0.916"))
       ).to.be.revertedWithCustomError(vault, "InvalidLTV");
     });
 
