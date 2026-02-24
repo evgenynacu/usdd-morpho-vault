@@ -847,13 +847,16 @@ describe("SUSDDVault Unit Tests", function () {
     });
 
     it("should not harvest when performanceFeeBps is 0", async function () {
-      // Use admin who has MANAGER_ROLE from initialize
       await vault.connect(admin).setPerformanceFee(0);
 
-      // Even if there's profit simulation, no fees should be collected
+      const supplyBefore = await vault.totalSupply();
+      const feeRecipientSharesBefore = await vault.balanceOf(admin.address);
+
       await vault.connect(admin).claimRewards("0x");
 
-      // Just checking it doesn't revert
+      // No fee shares should be minted
+      expect(await vault.totalSupply()).to.equal(supplyBefore);
+      expect(await vault.balanceOf(admin.address)).to.equal(feeRecipientSharesBefore);
     });
   });
 
@@ -1027,6 +1030,13 @@ describe("SUSDDVault Unit Tests", function () {
 
         await expect(vault.connect(keeper).claimRewards(claimData))
           .to.emit(vault, "VaultSnapshot");
+      });
+
+      it("should work as heartbeat even when merkl distributor is set", async function () {
+        // merklDistributor is set in beforeEach, but empty data should skip claim
+        await expect(vault.connect(keeper).claimRewards("0x"))
+          .to.emit(vault, "VaultSnapshot")
+          .and.to.not.emit(vault, "RewardsClaimed");
       });
     });
   });

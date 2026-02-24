@@ -13,7 +13,7 @@ async function main() {
     targetLTV: ethers.parseUnits(process.env.LTV || "0.9", 18),
     performanceFeeBps: BigInt(process.env.FEE || "0"),
     maxTotalAssets: ethers.parseUnits(process.env.CAP || "500000", 6),
-    whitelistEnabled: (process.env.WHITELIST ?? "true") !== "false",
+    whitelistEnabled: process.env.WHITELIST !== "false",
   };
 
   console.log("\nDeployment Configuration:");
