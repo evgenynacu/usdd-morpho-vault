@@ -47,6 +47,8 @@ describe("SUSDDVault Fork Tests", function () {
     ) as unknown as SUSDDVault;
     await vault.waitForDeployment();
     await vault.connect(admin).grantRole(KEEPER_ROLE, keeper.address);
+    await vault.connect(admin).addToWhitelist(user1.address);
+    await vault.connect(admin).addToWhitelist(admin.address);
   }
 
   async function fundWithUSDT(recipient: string, amount: bigint) {

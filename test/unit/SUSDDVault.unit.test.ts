@@ -425,11 +425,10 @@ describe("SUSDDVault Unit Tests", function () {
       expect(await vault.totalAssets()).to.equal(amount);
     });
 
-    it("should return 0 previewDeposit when no supply (first deposit case)", async function () {
-      // First deposit: previewDeposit returns estimated value, not 0
+    it("should return positive previewDeposit when no supply (first deposit)", async function () {
       const assets = ethers.parseUnits("1000", 6);
       const preview = await vault.previewDeposit(assets);
-      // With mock, this should return some value (the estimated deposit value)
+      // First deposit: previewDeposit returns estimated value based on initial 1:1 ratio
       expect(preview).to.be.gt(0);
     });
 
@@ -827,6 +826,36 @@ describe("SUSDDVault Unit Tests", function () {
       expect(totalSupplyAfter).to.equal(totalSupplyBefore);
       // Fee recipient should not get additional shares
       expect(feeRecipientSharesAfter).to.equal(feeRecipientSharesBefore);
+    });
+
+    it("should mint fee shares when NAV grows above high water mark", async function () {
+      // Whitelist user1
+      await vault.connect(manager).addToWhitelist(user1.address);
+
+      // Set targetLTV to IDLE_MODE to keep USDT in vault (no leverage)
+      await vault.connect(keeper).rebalance(ethers.MaxUint256);
+
+      // Deposit
+      const depositAmount = ethers.parseUnits("10000", 6);
+      await vault.connect(user1).deposit(depositAmount, user1.address);
+
+      const hwmBefore = await vault.highWaterMark();
+      const feeRecipientSharesBefore = await vault.balanceOf(admin.address);
+
+      // Simulate profit: mint extra USDT directly to vault (increases NAV)
+      await usdt.mint(await vault.getAddress(), ethers.parseUnits("1000", 6));
+
+      // Trigger fee accrual via claimRewards heartbeat
+      await vault.connect(admin).claimRewards("0x");
+
+      const hwmAfter = await vault.highWaterMark();
+      const feeRecipientSharesAfter = await vault.balanceOf(admin.address);
+
+      // High water mark should increase
+      expect(hwmAfter).to.be.gt(hwmBefore);
+
+      // Fee recipient should have received shares
+      expect(feeRecipientSharesAfter).to.be.gt(feeRecipientSharesBefore);
     });
 
     it("should not harvest when performanceFeeBps is 0", async function () {

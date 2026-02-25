@@ -345,62 +345,11 @@ describe("Security Unit Tests", function () {
       console.log(`Redeemed ${ethers.formatUnits(redeemShares, 18)} shares, received ${ethers.formatUnits(received, 6)} USDT`);
     });
 
-    it("Branch 3: sharesToRepay==0, collateralToWithdraw>0, debt exists - SKIP (requires artificial state)", async function () {
-      /**
-       * Branch 3 requires: borrowShares << collateral (unusual ratio)
-       * - sharesToRepay = borrowShares * shares / totalSupply = 0
-       * - collateralToWithdraw = collateral * shares / totalSupply > 0
-       * - pos.borrowShares > 0
-       *
-       * This state cannot occur through normal vault operations because:
-       * - Deposit creates position with consistent LTV ratio
-       * - collateral and borrowShares scale together
-       *
-       * To test this branch properly, we would need to:
-       * 1. Directly manipulate mock position to have borrowShares << collateral
-       * 2. But vault shares wouldn't match the artificial position
-       *
-       * This is a DEFENSIVE branch for edge cases like:
-       * - External partial debt repayment
-       * - Oracle manipulation scenarios
-       *
-       * The branch EXISTS in code (verified by inspection) and protects LTV.
-       */
-
-      console.log("Branch 3 (sharesToRepay=0, collateralToWithdraw>0, debt exists):");
-      console.log("  Cannot trigger through normal operations");
-      console.log("  Requires borrowShares << collateral (unusual ratio)");
-      console.log("  Branch verified to exist in code at SUSDDVault.sol:437-438");
-      console.log("  SKIPPED: Would need artificial state manipulation");
-
-      this.skip();
-    });
-
-    it("Branch 4: sharesToRepay>0, collateralToWithdraw==0 - SKIP (requires artificial state)", async function () {
-      /**
-       * Branch 4 requires: collateral << borrowShares (unusual ratio)
-       * - sharesToRepay = borrowShares * shares / totalSupply > 0
-       * - collateralToWithdraw = collateral * shares / totalSupply = 0
-       *
-       * This state cannot occur through normal vault operations because:
-       * - Morpho requires sufficient collateral for borrowing (LTV limit)
-       * - If collateral << borrowShares, position would be liquidatable
-       *
-       * This is a DEFENSIVE branch that prevents:
-       * - Flash loan without collateral to repay it
-       * - Stuck transactions
-       *
-       * The branch EXISTS in code (verified by inspection).
-       */
-
-      console.log("Branch 4 (sharesToRepay>0, collateralToWithdraw=0):");
-      console.log("  Cannot trigger through normal operations");
-      console.log("  Requires collateral << borrowShares (would be liquidated)");
-      console.log("  Branch verified to exist in code at SUSDDVault.sol:439");
-      console.log("  SKIPPED: Would need artificial state manipulation");
-
-      this.skip();
-    });
+    // Note: Branch 3 (sharesToRepay=0, collateralToWithdraw>0, debt exists) and
+    // Branch 4 (sharesToRepay>0, collateralToWithdraw=0) are defensive branches
+    // that cannot be triggered through normal vault operations. They protect against
+    // external state manipulation (e.g., partial debt repayment, oracle issues).
+    // Verified to exist in code by inspection.
 
     it("Branch 5: both round to 0 - verified with tiny redemption", async function () {
       /**
@@ -479,54 +428,51 @@ describe("Security Unit Tests", function () {
   // 3. ZERO NAV PROTECTION
   // ============================================================
   describe("ZeroNAV Protection", function () {
-    it("should block deposits when previewDeposit returns 0", async function () {
-      // First deposit to create shares
+    it("should block deposits when NAV=0 and shares exist", async function () {
+      // Use IDLE_MODE so deposit creates idle USDT (no leverage)
+      await vault.connect(keeper).rebalance(ethers.MaxUint256);
+
+      // First deposit to create shares with idle USDT
       const depositAmount = ethers.parseUnits("1000", 6);
       await vault.connect(user1).deposit(depositAmount, user1.address);
 
       const sharesBefore = await vault.totalSupply();
       expect(sharesBefore).to.be.gt(0);
 
+      // Now switch to leveraged mode and rebalance to move USDT into position
+      await vault.connect(keeper).rebalance(ethers.parseEther("0.75"));
+
       // Manipulate sUSDD rate to near zero (simulating total depeg)
-      // This makes collateral value ≈ 0
+      // This makes collateral value ≈ 0, and mock debt = 0, so NAV = 0
       await susdd.setRate(1); // 1 wei per share = essentially 0
 
-      // totalAssets should now be very low or 0
       const nav = await vault.totalAssets();
+      expect(nav).to.equal(0n, "NAV should be 0 after sUSDD depeg");
 
-      // If NAV is 0 and shares exist, deposits should be blocked
-      // Could revert with either ZeroNAV (in _deposit) or ERC4626ExceededMaxDeposit (in deposit wrapper)
-      // Both protect the user - the important thing is deposit is blocked
-      if (nav === 0n) {
-        await expect(
-          vault.connect(user2).deposit(depositAmount, user2.address)
-        ).to.be.reverted; // Accept any revert - both ZeroNAV and ERC4626ExceededMaxDeposit protect users
-
-        console.log("Deposit correctly blocked when NAV=0");
-      } else {
-        // NAV not 0 due to mock limitations - document this
-        console.log(`NAV = ${ethers.formatUnits(nav, 6)} (mock limitation - expectedBorrowAssets returns incorrect value)`);
-      }
+      // Deposits should be blocked
+      await expect(
+        vault.connect(user2).deposit(depositAmount, user2.address)
+      ).to.be.reverted;
     });
 
     it("maxDeposit should return 0 when NAV=0 and shares exist", async function () {
-      // First deposit
+      // Use IDLE_MODE so deposit creates idle USDT
+      await vault.connect(keeper).rebalance(ethers.MaxUint256);
+
       const depositAmount = ethers.parseUnits("1000", 6);
       await vault.connect(user1).deposit(depositAmount, user1.address);
 
-      // Set rate to near zero
+      // Move to leveraged mode then depeg sUSDD
+      await vault.connect(keeper).rebalance(ethers.parseEther("0.75"));
       await susdd.setRate(1);
 
       const nav = await vault.totalAssets();
       const supply = await vault.totalSupply();
-      const maxDep = await vault.maxDeposit(user2.address);
+      expect(nav).to.equal(0n);
+      expect(supply).to.be.gt(0n);
 
-      if (nav === 0n && supply > 0n) {
-        expect(maxDep).to.equal(0);
-        console.log("maxDeposit correctly returns 0 when NAV=0 and shares exist");
-      } else {
-        console.log(`NAV=${nav}, supply=${supply}, maxDeposit=${maxDep}`);
-      }
+      const maxDep = await vault.maxDeposit(user2.address);
+      expect(maxDep).to.equal(0);
     });
   });
 
@@ -550,34 +496,31 @@ describe("Security Unit Tests", function () {
      */
 
     it("underwater via sUSDD depeg should block deposits", async function () {
-      // Create leveraged position
-      await vault.connect(keeper).rebalance(ethers.parseEther("0.75"));
+      // Use IDLE_MODE first to deposit, then leverage, then depeg
+      await vault.connect(keeper).rebalance(ethers.MaxUint256);
       const depositAmount = ethers.parseUnits("10000", 6);
       await vault.connect(user1).deposit(depositAmount, user1.address);
 
       const supplyBefore = await vault.totalSupply();
       expect(supplyBefore).to.be.gt(0);
 
+      // Move to leveraged mode (USDT goes to position)
+      await vault.connect(keeper).rebalance(ethers.parseEther("0.75"));
+
       // Depeg sUSDD to 0 - makes collateral value 0
-      // This creates ZeroNAV scenario
       await susdd.setRate(1);
 
       const nav = await vault.totalAssets();
+      expect(nav).to.equal(0n, "NAV should be 0 after sUSDD depeg");
 
-      // Deposits should be blocked when NAV=0 and shares exist
-      if (nav === 0n) {
-        await expect(
-          vault.connect(user2).deposit(depositAmount, user2.address)
-        ).to.be.reverted;
-        console.log("✓ Deposits blocked when underwater (ZeroNAV)");
+      // Deposits should be blocked
+      await expect(
+        vault.connect(user2).deposit(depositAmount, user2.address)
+      ).to.be.reverted;
 
-        // maxDeposit should return 0
-        const maxDep = await vault.maxDeposit(user2.address);
-        expect(maxDep).to.equal(0);
-        console.log("✓ maxDeposit returns 0 when underwater");
-      } else {
-        console.log(`NAV=${nav} - mock limitation, debt not calculated correctly`);
-      }
+      // maxDeposit should return 0
+      const maxDep = await vault.maxDeposit(user2.address);
+      expect(maxDep).to.equal(0);
     });
 
     it("underwater check exists in rebalance (documented behavior)", async function () {

@@ -530,10 +530,16 @@ contract SUSDDVault is
             // - both round to 0 → nothing to unwind
         }
 
-        // Transfer proportional idle + net gain from position unwind
+        // Transfer proportional idle + net result from position unwind
+        // If unwind caused a loss (e.g. PSM tout fee), deduct from withdrawer's idle portion
         uint256 balanceAfter = IERC20(Constants.USDT).balanceOf(address(this));
-        uint256 gainFromPosition = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
-        uint256 toTransfer = idleToWithdraw + gainFromPosition;
+        uint256 toTransfer;
+        if (balanceAfter >= balanceBefore) {
+            toTransfer = idleToWithdraw + (balanceAfter - balanceBefore);
+        } else {
+            uint256 loss = balanceBefore - balanceAfter;
+            toTransfer = idleToWithdraw > loss ? idleToWithdraw - loss : 0;
+        }
         IERC20(Constants.USDT).safeTransfer(receiver, toTransfer);
 
         return toTransfer;
