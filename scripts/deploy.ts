@@ -55,25 +55,16 @@ async function main() {
   console.log("  High Water Mark:", ethers.formatUnits(await vault.highWaterMark(), 18));
 
   // Check roles
-  const DEFAULT_ADMIN_ROLE = await vault.DEFAULT_ADMIN_ROLE();
-  const KEEPER_ROLE = await vault.KEEPER_ROLE();
-  const MANAGER_ROLE = await vault.MANAGER_ROLE();
-  const PAUSER_ROLE = await vault.PAUSER_ROLE();
+  const DEFAULT_ADMIN_ROLE = "0x0000000000000000000000000000000000000000000000000000000000000000";
+  const KEEPER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
+  const MANAGER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("MANAGER_ROLE"));
+  const PAUSER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("PAUSER_ROLE"));
 
   console.log("\nRoles:");
   console.log("  Admin has DEFAULT_ADMIN_ROLE:", await vault.hasRole(DEFAULT_ADMIN_ROLE, config.admin));
   console.log("  Admin has KEEPER_ROLE:", await vault.hasRole(KEEPER_ROLE, config.admin));
   console.log("  Admin has MANAGER_ROLE:", await vault.hasRole(MANAGER_ROLE, config.admin));
   console.log("  Admin has PAUSER_ROLE:", await vault.hasRole(PAUSER_ROLE, config.admin));
-
-  // Check market params
-  const marketParams = await vault.marketParams();
-  console.log("\nCached Market Params:");
-  console.log("  Loan Token:", marketParams.loanToken);
-  console.log("  Collateral Token:", marketParams.collateralToken);
-  console.log("  Oracle:", marketParams.oracle);
-  console.log("  IRM:", marketParams.irm);
-  console.log("  LLTV:", ethers.formatUnits(marketParams.lltv, 16) + "%");
 
   // Whitelist setup
   if (config.whitelistEnabled) {

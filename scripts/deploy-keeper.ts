@@ -49,8 +49,8 @@ async function main() {
 
       const vault = VaultFactory.attach(vaultAddr);
 
-      const KEEPER_ROLE = await vault.KEEPER_ROLE();
-      const PAUSER_ROLE = await vault.PAUSER_ROLE();
+      const KEEPER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
+      const PAUSER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("PAUSER_ROLE"));
 
       const grantKeeperTx = await vault.grantRole(KEEPER_ROLE, keeperAddress);
       await grantKeeperTx.wait();

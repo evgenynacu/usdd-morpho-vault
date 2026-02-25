@@ -22,6 +22,7 @@ describe("SUSDDVault Fork Tests", function () {
   let user1: HardhatEthersSigner;
   let feeRecipient: HardhatEthersSigner;
 
+  const KEEPER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
   const TARGET_LTV = ethers.parseUnits("0.75", 18); // 75%
   const PERFORMANCE_FEE = 1000n; // 10%
   const MAX_TOTAL_ASSETS = ethers.parseUnits("10000000", 6); // 10M USDT
@@ -45,7 +46,7 @@ describe("SUSDDVault Fork Tests", function () {
       { kind: "uups" }
     ) as unknown as SUSDDVault;
     await vault.waitForDeployment();
-    await vault.connect(admin).grantRole(await vault.KEEPER_ROLE(), keeper.address);
+    await vault.connect(admin).grantRole(KEEPER_ROLE, keeper.address);
   }
 
   async function fundWithUSDT(recipient: string, amount: bigint) {

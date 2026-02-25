@@ -26,6 +26,7 @@ describe("Security Tests - Protecting Existing Users", function () {
   let bob: HardhatEthersSigner;
   let feeRecipient: HardhatEthersSigner;
 
+  const KEEPER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
   const TARGET_LTV = ethers.parseUnits("0.75", 18);
   const PERFORMANCE_FEE = 1000n;
   const MAX_TOTAL_ASSETS = ethers.parseUnits("10000000", 6);
@@ -48,7 +49,7 @@ describe("Security Tests - Protecting Existing Users", function () {
       { kind: "uups" }
     ) as unknown as SUSDDVault;
     await vault.waitForDeployment();
-    await vault.connect(admin).grantRole(await vault.KEEPER_ROLE(), keeper.address);
+    await vault.connect(admin).grantRole(KEEPER_ROLE, keeper.address);
   }
 
   async function fundWithUSDT(recipient: string, amount: bigint) {
@@ -687,20 +688,12 @@ describe("Security Tests - Protecting Existing Users", function () {
       await ethers.provider.send("evm_mine", []);
 
       // Force Morpho to accrue interest
-      const mp = await vault.marketParams();
-      const marketParams = {
-        loanToken: mp.loanToken,
-        collateralToken: mp.collateralToken,
-        oracle: mp.oracle,
-        irm: mp.irm,
-        lltv: mp.lltv
-      };
-
       const morpho = await ethers.getContractAt(
         "@morpho-org/morpho-blue/src/interfaces/IMorpho.sol:IMorpho",
         ADDRESSES.MORPHO
       );
-      await morpho.accrueInterest(marketParams);
+      const mp = await morpho.idToMarketParams(MARKET_ID);
+      await morpho.accrueInterest(mp);
 
       const navAfter = await vault.totalAssets();
       const posAfter = await getPosition(vaultAddress);

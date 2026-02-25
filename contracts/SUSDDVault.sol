@@ -37,9 +37,9 @@ contract SUSDDVault is
 
     // ============ Roles ============
 
-    bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
-    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
-    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 internal constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
+    bytes32 internal constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
+    bytes32 internal constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     // ============ Storage ============
 
@@ -59,7 +59,7 @@ contract SUSDDVault is
     uint256 public maxTotalAssets;
 
     /// @notice Cached Morpho market params
-    MarketParams public marketParams;
+    MarketParams internal marketParams;
 
     // ============ Whitelist ============
 
@@ -72,7 +72,7 @@ contract SUSDDVault is
     // ============ Merkl Rewards ============
 
     /// @notice Merkl distributor contract address
-    address public merklDistributor;
+    address internal merklDistributor;
 
     /// @notice Storage gap for future upgrades
     uint256[47] private __gap;
@@ -87,7 +87,7 @@ contract SUSDDVault is
     /// @dev When targetLTV = IDLE_MODE:
     ///      - Deposits stay as idle USDT
     ///      - rebalance(IDLE_MODE) converts everything to idle USDT
-    uint256 public constant IDLE_MODE = type(uint256).max;
+    uint256 internal constant IDLE_MODE = type(uint256).max;
 
     // Flash loan operation types
     uint8 private constant OP_DEPOSIT = 1;
@@ -97,11 +97,10 @@ contract SUSDDVault is
 
     // ============ Events ============
 
-    event TargetLTVUpdated(uint256 oldLTV, uint256 newLTV);
     event PerformanceFeeUpdated(uint256 oldFee, uint256 newFee);
     event FeeRecipientUpdated(address oldRecipient, address newRecipient);
     event MaxTotalAssetsUpdated(uint256 oldMax, uint256 newMax);
-    event Rebalanced(uint256 oldLTV, uint256 newLTV, uint256 collateralBefore, uint256 debtBefore);
+    event Rebalanced(uint256 oldLTV, uint256 newLTV);
     event PerformanceFeeAccrued(uint256 feeShares, address indexed recipient);
     event WhitelistEnabledUpdated(bool enabled);
     event AddedToWhitelist(address indexed account);
@@ -251,6 +250,19 @@ contract SUSDDVault is
     function maxRedeem(address owner) public view override returns (uint256) {
         if (whitelistEnabled && !whitelisted[owner]) return 0;
         return balanceOf(owner);
+    }
+
+    /// @notice Deposit assets and return actual shares minted
+    /// @dev Overrides OZ ERC4626 to return real minted amount instead of preview estimate
+    function deposit(uint256 assets, address receiver) public override returns (uint256) {
+        uint256 maxAssets = maxDeposit(receiver);
+        if (assets > maxAssets) {
+            revert ERC4626ExceededMaxDeposit(receiver, assets, maxAssets);
+        }
+
+        uint256 sharesBefore = balanceOf(receiver);
+        _deposit(_msgSender(), receiver, assets, 0);
+        return balanceOf(receiver) - sharesBefore;
     }
 
     /// @notice Preview shares for deposit (Delta NAV approach)
@@ -569,7 +581,6 @@ contract SUSDDVault is
         IMorpho morpho = IMorpho(Constants.MORPHO);
         Position memory pos = morpho.position(Id.wrap(Constants.MARKET_ID), address(this));
         uint256 debtBefore = morpho.expectedBorrowAssets(marketParams, address(this));
-        uint256 collateralBefore = pos.collateral;
 
         // Check for underwater position BEFORE updating state (true no-op)
         // Underwater = idle + collateral value <= debt
@@ -582,12 +593,10 @@ contract SUSDDVault is
         uint256 oldTargetLTV = targetLTV;
         targetLTV = newTargetLTV;
 
-        emit TargetLTVUpdated(oldTargetLTV, newTargetLTV);
-
         // IDLE_MODE: Full exit to USDT
         if (newTargetLTV == IDLE_MODE) {
             _exitToIdleUsdt(pos, debtBefore);
-            emit Rebalanced(oldTargetLTV, newTargetLTV, collateralBefore, debtBefore);
+            emit Rebalanced(oldTargetLTV, newTargetLTV);
             _emitSnapshot(totalAssets(), supply);
             return;
         }
@@ -595,7 +604,7 @@ contract SUSDDVault is
         // LTV = 0: Unleveraged sUSDD mode
         if (newTargetLTV == 0) {
             _transitionToUnleveraged(pos, debtBefore);
-            emit Rebalanced(oldTargetLTV, newTargetLTV, collateralBefore, debtBefore);
+            emit Rebalanced(oldTargetLTV, newTargetLTV);
             _emitSnapshot(totalAssets(), supply);
             return;
         }
@@ -603,7 +612,7 @@ contract SUSDDVault is
         // LTV > 0: Leveraged mode
         if (navCached == 0) {
             // Underwater or no assets - cannot rebalance
-            emit Rebalanced(oldTargetLTV, newTargetLTV, collateralBefore, debtBefore);
+            emit Rebalanced(oldTargetLTV, newTargetLTV);
             _emitSnapshot(navCached, supply);
             return;
         }
@@ -622,7 +631,7 @@ contract SUSDDVault is
             _delever(debtToRepay, false);
         }
 
-        emit Rebalanced(oldTargetLTV, newTargetLTV, collateralBefore, debtBefore);
+        emit Rebalanced(oldTargetLTV, newTargetLTV);
         _emitSnapshot(totalAssets(), supply);
     }
 
@@ -781,13 +790,6 @@ contract SUSDDVault is
         emit RemovedFromWhitelist(account);
     }
 
-    /// @notice Batch add addresses to whitelist
-    function addToWhitelistBatch(address[] calldata accounts) external onlyRole(MANAGER_ROLE) {
-        for (uint256 i = 0; i < accounts.length; i++) {
-            whitelisted[accounts[i]] = true;
-            emit AddedToWhitelist(accounts[i]);
-        }
-    }
 
     // ============ Merkl Rewards ============
 

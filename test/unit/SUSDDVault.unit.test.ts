@@ -20,6 +20,10 @@ const ADDRESSES = {
 
 const MARKET_ID = "0x29ae8cad946d861464d5e829877245a863a18157c0cde2c3524434dafa34e476";
 const WAD = ethers.parseEther("1");
+const KEEPER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
+const MANAGER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("MANAGER_ROLE"));
+const PAUSER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("PAUSER_ROLE"));
+const IDLE_MODE = ethers.MaxUint256;
 
 describe("SUSDDVault Unit Tests", function () {
   let admin: SignerWithAddress;
@@ -129,8 +133,8 @@ describe("SUSDDVault Unit Tests", function () {
     ) as unknown as SUSDDVault;
 
     // Grant roles
-    await vault.connect(admin).grantRole(await vault.KEEPER_ROLE(), keeper.address);
-    await vault.connect(admin).grantRole(await vault.MANAGER_ROLE(), manager.address);
+    await vault.connect(admin).grantRole(KEEPER_ROLE, keeper.address);
+    await vault.connect(admin).grantRole(MANAGER_ROLE, manager.address);
 
     // Mint USDT to users
     await usdt.mint(user1.address, ethers.parseUnits("100000", 6));
@@ -161,9 +165,9 @@ describe("SUSDDVault Unit Tests", function () {
 
     it("should set correct roles", async function () {
       expect(await vault.hasRole(await vault.DEFAULT_ADMIN_ROLE(), admin.address)).to.be.true;
-      expect(await vault.hasRole(await vault.KEEPER_ROLE(), admin.address)).to.be.true;
-      expect(await vault.hasRole(await vault.KEEPER_ROLE(), keeper.address)).to.be.true;
-      expect(await vault.hasRole(await vault.MANAGER_ROLE(), manager.address)).to.be.true;
+      expect(await vault.hasRole(KEEPER_ROLE, admin.address)).to.be.true;
+      expect(await vault.hasRole(KEEPER_ROLE, keeper.address)).to.be.true;
+      expect(await vault.hasRole(MANAGER_ROLE, manager.address)).to.be.true;
     });
 
     it("should accept IDLE_MODE as targetLTV", async function () {
@@ -284,23 +288,23 @@ describe("SUSDDVault Unit Tests", function () {
     it("should allow admin to grant/revoke roles", async function () {
       const newKeeper = user1.address;
 
-      await vault.connect(admin).grantRole(await vault.KEEPER_ROLE(), newKeeper);
-      expect(await vault.hasRole(await vault.KEEPER_ROLE(), newKeeper)).to.be.true;
+      await vault.connect(admin).grantRole(KEEPER_ROLE, newKeeper);
+      expect(await vault.hasRole(KEEPER_ROLE, newKeeper)).to.be.true;
 
-      await vault.connect(admin).revokeRole(await vault.KEEPER_ROLE(), newKeeper);
-      expect(await vault.hasRole(await vault.KEEPER_ROLE(), newKeeper)).to.be.false;
+      await vault.connect(admin).revokeRole(KEEPER_ROLE, newKeeper);
+      expect(await vault.hasRole(KEEPER_ROLE, newKeeper)).to.be.false;
     });
 
     it("should not allow non-admin to grant roles", async function () {
       await expect(
-        vault.connect(user1).grantRole(await vault.KEEPER_ROLE(), user2.address)
+        vault.connect(user1).grantRole(KEEPER_ROLE, user2.address)
       ).to.be.reverted;
     });
   });
 
   describe("Pausable", function () {
     it("should allow pauser to pause", async function () {
-      await vault.connect(admin).grantRole(await vault.PAUSER_ROLE(), keeper.address);
+      await vault.connect(admin).grantRole(PAUSER_ROLE, keeper.address);
       await vault.connect(keeper).pause();
       expect(await vault.paused()).to.be.true;
     });
@@ -567,12 +571,12 @@ describe("SUSDDVault Unit Tests", function () {
       expect(await vault.targetLTV()).to.equal(newLTV);
     });
 
-    it("should emit TargetLTVUpdated event", async function () {
+    it("should emit Rebalanced event", async function () {
       const oldLTV = await vault.targetLTV();
       const newLTV = ethers.parseEther("0.5");
 
       await expect(vault.connect(keeper).rebalance(newLTV))
-        .to.emit(vault, "TargetLTVUpdated")
+        .to.emit(vault, "Rebalanced")
         .withArgs(oldLTV, newLTV);
     });
   });
@@ -720,22 +724,6 @@ describe("SUSDDVault Unit Tests", function () {
         expect(await vault.whitelistEnabled()).to.be.true;
       });
 
-      it("should allow batch add to whitelist", async function () {
-        const addresses = [user1.address, user2.address];
-
-        const tx = vault.connect(manager).addToWhitelistBatch(addresses);
-
-        await expect(tx)
-          .to.emit(vault, "AddedToWhitelist")
-          .withArgs(user1.address);
-        await expect(tx)
-          .to.emit(vault, "AddedToWhitelist")
-          .withArgs(user2.address);
-
-        expect(await vault.whitelisted(user1.address)).to.be.true;
-        expect(await vault.whitelisted(user2.address)).to.be.true;
-      });
-
       it("should not allow non-manager to add to whitelist", async function () {
         await expect(
           vault.connect(user1).addToWhitelist(user2.address)
@@ -756,11 +744,6 @@ describe("SUSDDVault Unit Tests", function () {
         ).to.be.reverted;
       });
 
-      it("should not allow non-manager to batch add", async function () {
-        await expect(
-          vault.connect(user1).addToWhitelistBatch([user2.address])
-        ).to.be.reverted;
-      });
     });
 
     describe("Default state", function () {
@@ -882,8 +865,6 @@ describe("SUSDDVault Unit Tests", function () {
         await expect(vault.connect(admin).setMerklDistributor(newDistributor))
           .to.emit(vault, "MerklDistributorUpdated")
           .withArgs(await merklDistributor.getAddress(), newDistributor);
-
-        expect(await vault.merklDistributor()).to.equal(newDistributor);
       });
 
       it("should revert if non-admin tries to set merkl distributor", async function () {
@@ -923,7 +904,7 @@ describe("SUSDDVault Unit Tests", function () {
           { kind: "uups" }
         ) as unknown as SUSDDVault;
 
-        await freshVault.connect(admin).grantRole(await freshVault.KEEPER_ROLE(), keeper.address);
+        await freshVault.connect(admin).grantRole(KEEPER_ROLE, keeper.address);
 
         const claimData = merklDistributor.interface.encodeFunctionData("claim", [[], [], [], []]);
         await expect(

@@ -26,6 +26,8 @@ const ADDRESSES = {
 
 const MARKET_ID = "0x29ae8cad946d861464d5e829877245a863a18157c0cde2c3524434dafa34e476";
 const WAD = ethers.parseEther("1");
+const KEEPER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
+const MANAGER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("MANAGER_ROLE"));
 
 describe("Security Unit Tests", function () {
   let admin: SignerWithAddress;
@@ -109,8 +111,8 @@ describe("Security Unit Tests", function () {
       { kind: "uups" }
     ) as unknown as SUSDDVault;
 
-    await vault.connect(admin).grantRole(await vault.KEEPER_ROLE(), keeper.address);
-    await vault.connect(admin).grantRole(await vault.MANAGER_ROLE(), manager.address);
+    await vault.connect(admin).grantRole(KEEPER_ROLE, keeper.address);
+    await vault.connect(admin).grantRole(MANAGER_ROLE, manager.address);
 
     // Mint USDT to users
     await usdt.mint(user1.address, ethers.parseUnits("1000000", 6));
@@ -119,6 +121,10 @@ describe("Security Unit Tests", function () {
     // Approve vault
     await usdt.connect(user1).approve(await vault.getAddress(), ethers.MaxUint256);
     await usdt.connect(user2).approve(await vault.getAddress(), ethers.MaxUint256);
+
+    // Whitelist users
+    await vault.connect(manager).addToWhitelist(user1.address);
+    await vault.connect(manager).addToWhitelist(user2.address);
   });
 
   beforeEach(async function () {

@@ -30,9 +30,9 @@ async function main() {
   };
 
   // Get role constants
-  const KEEPER_ROLE = await vault.KEEPER_ROLE();
-  const MANAGER_ROLE = await vault.MANAGER_ROLE();
-  const PAUSER_ROLE = await vault.PAUSER_ROLE();
+  const KEEPER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
+  const MANAGER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("MANAGER_ROLE"));
+  const PAUSER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("PAUSER_ROLE"));
 
   // Grant roles
   if (config.keeper !== ethers.ZeroAddress) {
