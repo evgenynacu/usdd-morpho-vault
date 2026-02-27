@@ -192,31 +192,29 @@ describe("Security Unit Tests", function () {
         await psm.setTout(ethers.parseEther("0.01")); // 1%
       });
 
-      it("redeem should revert when tout > 0 (fail-safe, shares not burned)", async function () {
+      it("redeem should succeed with tout > 0 (user receives less USDT)", async function () {
         const sharesBefore = await vault.balanceOf(user1.address);
         expect(sharesBefore).to.be.gt(0);
 
-        // Try to redeem - should revert because vault expects 1:1 but PSM takes fee
-        // The revert happens during flash loan repayment (not enough USDT)
-        await expect(
-          vault.connect(user1).redeem(sharesBefore, user1.address, user1.address)
-        ).to.be.reverted;
+        const usdtBefore = await usdt.balanceOf(user1.address);
 
-        // Verify shares were NOT burned (transaction reverted)
+        // Redeem should succeed — SwapHelper accounts for tout fee
+        await vault.connect(user1).redeem(sharesBefore, user1.address, user1.address);
+
+        const usdtAfter = await usdt.balanceOf(user1.address);
         const sharesAfter = await vault.balanceOf(user1.address);
-        expect(sharesAfter).to.equal(sharesBefore);
 
-        console.log(`Shares preserved after failed redeem: ${ethers.formatUnits(sharesAfter, 18)}`);
+        // Shares burned, user received USDT (less than deposited due to tout)
+        expect(sharesAfter).to.equal(0);
+        expect(usdtAfter).to.be.gt(usdtBefore);
       });
 
       it("rebalance (delever) behavior with tout > 0 (mock limitation - see fork tests)", async function () {
         /**
-         * Expected behavior (when tout > 0):
-         * - Delever requires converting sUSDD -> USDD -> USDT via PSM buyGem
-         * - When tout > 0, MORE USDD is required for the same USDT
-         * - Flash loan repayment fails (vault doesn't have enough USDD)
+         * With tout > 0, delever converts sUSDD -> USDD -> USDT via PSM buyGem.
+         * SwapHelper accounts for tout fee (reduced gemAmt), so it doesn't revert.
          *
-         * Mock limitation (why this can't be tested in unit tests):
+         * Mock limitation (why delever can't be tested in unit tests):
          * - MorphoBalancesLib.expectedBorrowAssets() reads storage via extSloads
          * - MockMorpho.extSloads() returns zeros
          * - Vault thinks currentDebt = 0, so delever becomes no-op
@@ -245,14 +243,19 @@ describe("Security Unit Tests", function () {
         console.log(`targetLTV updated: ${ethers.formatEther(targetLTVBefore)} -> ${ethers.formatEther(targetLTVAfter)}`);
       });
 
-      it("rebalance to IDLE_MODE should revert when tout > 0", async function () {
+      it("rebalance to IDLE_MODE should succeed with tout > 0 (less USDT received)", async function () {
         const IDLE_MODE = ethers.MaxUint256;
 
-        await expect(
-          vault.connect(keeper).rebalance(IDLE_MODE)
-        ).to.be.reverted;
+        const usdtBefore = await usdt.balanceOf(await vault.getAddress());
 
-        console.log("Exit to IDLE_MODE reverted as expected when tout > 0");
+        // Should succeed — SwapHelper accounts for tout fee
+        await vault.connect(keeper).rebalance(IDLE_MODE);
+
+        expect(await vault.targetLTV()).to.equal(IDLE_MODE);
+
+        // Vault should have USDT (converted from position, minus tout fee)
+        const usdtAfter = await usdt.balanceOf(await vault.getAddress());
+        expect(usdtAfter).to.be.gt(usdtBefore);
       });
     });
   });
