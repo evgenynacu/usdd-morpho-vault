@@ -5,8 +5,8 @@
   "scripts": {
     "compile": "hardhat compile",
     "test": "hardhat test",
-    "test:unit": "hardhat test test/unit/SUSDDVault.unit.test.ts",
-    "test:fork": "hardhat test test/fork/SUSDDVault.fork.test.ts test/fork/SwapHelper.fork.test.ts test/fork/Interfaces.fork.test.ts",
+    "test:unit": "hardhat test test/unit/*.test.ts",
+    "test:fork": "hardhat test test/fork/*.test.ts",
     "deploy": "hardhat run scripts/deploy.ts",
     "deploy:mainnet": "hardhat run scripts/deploy.ts --network mainnet",
     "configure": "hardhat run scripts/configure.ts",
