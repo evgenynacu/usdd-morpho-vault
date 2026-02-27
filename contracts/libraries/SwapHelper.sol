@@ -11,11 +11,10 @@ import "./Constants.sol";
 /// @notice Library for swapping between USDT and sUSDD via PSM and sUSDD vault
 /// @dev All functions are internal and operate on behalf of the calling contract
 ///
-/// PSM Fee Assumption:
-/// This library assumes PSM tin/tout fees are 0 (current mainnet state).
-/// If PSM governance enables fees, swap functions will revert and the vault
-/// will need to be upgraded. This simplifies code and saves gas.
-/// Probability of fee change is low; upgrade path exists if needed.
+/// PSM Fee Handling:
+/// - tout (buyGem fee): handled dynamically — gemAmt is reduced to account for fee
+/// - tin (sellGem fee): no code change needed — PSM takes fee from output USDD,
+///   and Delta NAV correctly reflects the reduced deposit value
 library SwapHelper {
     using SafeERC20 for IERC20;
 
@@ -61,8 +60,9 @@ library SwapHelper {
         // Step 2: USDD -> USDT via PSM
         usdd.forceApprove(Constants.PSM, usddReceived);
 
-        // When tout=0: gemAmt = usddReceived (scaled to 6 decimals)
-        uint256 gemAmt = usddReceived / 1e12;
+        // Max USDT we can buy: gemAmt = usddReceived / ((1e18 + tout) / 1e6)
+        // When tout=0 this simplifies to usddReceived / 1e12
+        uint256 gemAmt = usddReceived * 1e6 / (1e18 + psm.tout());
 
         uint256 usdtBalanceBefore = usdt.balanceOf(address(this));
         psm.buyGem(address(this), gemAmt);
@@ -77,7 +77,7 @@ library SwapHelper {
     }
 
     /// @notice Calculate the USDT value of sUSDD amount (for NAV calculation)
-    /// @dev Assumes 1:1 USDD:USDT peg (tin/tout = 0)
+    /// @dev Uses 1:1 USDD:USDT peg (ignores tout — NAV reflects collateral value, not exit value)
     /// @param susddAmount Amount of sUSDD (18 decimals)
     /// @return usdtValue USDT value (6 decimals)
     function getUSDTValue(uint256 susddAmount) internal view returns (uint256 usdtValue) {
@@ -88,7 +88,7 @@ library SwapHelper {
         // sUSDD -> USDD value
         uint256 usddValue = susdd.convertToAssets(susddAmount);
 
-        // USDD -> USDT (1:1 when tout=0)
+        // USDD -> USDT at 1:1 peg (NAV valuation, not swap)
         usdtValue = usddValue / 1e12;
     }
 
@@ -105,8 +105,8 @@ library SwapHelper {
         // USDD -> USDT via PSM
         usdd.forceApprove(Constants.PSM, usddAmount);
 
-        // When tout=0: gemAmt = usddAmount (scaled to 6 decimals)
-        uint256 gemAmt = usddAmount / 1e12;
+        // Max USDT we can buy: gemAmt = usddAmount / ((1e18 + tout) / 1e6)
+        uint256 gemAmt = usddAmount * 1e6 / (1e18 + psm.tout());
 
         uint256 usdtBalanceBefore = usdt.balanceOf(address(this));
         psm.buyGem(address(this), gemAmt);
@@ -151,8 +151,10 @@ library SwapHelper {
 
         IERC4626 susdd = IERC4626(Constants.SUSDD);
 
-        // USDT -> USDD needed (1:1 when tout=0)
-        uint256 usddNeeded = usdtAmount * 1e12;
+        // USDT -> USDD needed (accounts for PSM tout fee)
+        // Inverse of: gemAmt = usddAmount * 1e6 / (1e18 + tout)
+        uint256 tout = IPSM(Constants.PSM).tout();
+        uint256 usddNeeded = usdtAmount * (1e18 + tout) / 1e6;
 
         // How many sUSDD shares to burn for this USDD amount
         susddAmount = susdd.previewWithdraw(usddNeeded);

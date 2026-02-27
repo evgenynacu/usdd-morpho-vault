@@ -81,7 +81,7 @@ contract SUSDDVault is
 
     uint256 private constant MAX_BPS = 10000;
     uint256 private constant MAX_PERFORMANCE_FEE_BPS = 3000; // 30% max
-    uint256 private constant MAX_LTV = 0.915e18; // 90% max (below LLTV)
+    uint256 private constant MAX_LTV = 0.915e18; // 91.5% absolute ceiling (market LLTV is the binding constraint)
 
     /// @notice Special value for targetLTV meaning "idle USDT mode" (no position)
     /// @dev When targetLTV = IDLE_MODE:
