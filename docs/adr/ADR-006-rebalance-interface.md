@@ -37,18 +37,18 @@ The vault enforces safety checks on target LTV (for leveraged mode only):
 | Check | Constraint | Error |
 |-------|------------|-------|
 | Special modes | `IDLE_MODE` and `0` always valid | - |
-| Absolute maximum | `newTargetLTV <= 0.9e18` (90%) | `InvalidLTV` |
+| Absolute maximum | `newTargetLTV <= 0.915e18` (91.5%) | `InvalidLTV` |
 | Market LLTV | `newTargetLTV < marketParams.lltv` | `LTVExceedsLLTV` |
 
 **Why both checks for leveraged mode?**
-- `MAX_LTV` is a conservative hard limit (90%)
+- `MAX_LTV` is a conservative hard limit (91.5%)
 - `marketParams.lltv` is the actual liquidation threshold from Morpho market
 - Target must be below BOTH to ensure safety margin before liquidation
 
 **Example:**
 - Market LLTV: 86%
-- MAX_LTV constant: 90%
-- Valid targetLTV range: IDLE_MODE, 0, or 0.01% to 85.99%
+- MAX_LTV constant: 91.5%
+- Valid targetLTV range: IDLE_MODE, 0, or 0.01% to 85.99% (limited by LLTV in this example)
 
 ## State Changes
 
@@ -62,7 +62,7 @@ if (currentDebt > 0 && totalAssets() == 0) {
 targetLTV = newTargetLTV;
 
 // 3. Emits event
-emit TargetLTVUpdated(oldLTV, newLTV);
+emit Rebalanced(oldLTV, newLTV);
 
 // 4. Executes rebalance via flash loan
 if (targetDebt > currentDebt) _leverUp(additionalDebt);
@@ -121,5 +121,5 @@ targetDebt = NAV * newTargetLTV / (1 - newTargetLTV);
 ## Rebalance Blocked When
 
 - Vault is paused (`whenNotPaused` modifier)
-- Would exceed MAX_LTV (90%)
+- Would exceed MAX_LTV (91.5%)
 - Would exceed market LLTV (liquidation threshold)

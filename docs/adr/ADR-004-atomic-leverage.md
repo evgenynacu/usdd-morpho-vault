@@ -224,13 +224,12 @@ function flashLoan(address token, uint256 assets, bytes calldata data) external 
 
 ### Approval Strategy
 
-The vault sets infinite approval in constructor:
+The vault sets infinite approval in `initialize()`:
 
 ```solidity
-constructor(...) {
-    IERC20(Constants.USDT).forceApprove(Constants.MORPHO, type(uint256).max);
-    IERC20(Constants.SUSDD).forceApprove(Constants.MORPHO, type(uint256).max);
-}
+// In initialize()
+IERC20(Constants.USDT).forceApprove(Constants.MORPHO, type(uint256).max);
+IERC20(Constants.SUSDD).forceApprove(Constants.MORPHO, type(uint256).max);
 ```
 
 **Important:** Do NOT call `forceApprove` in callbacks — it would overwrite infinite approval with a smaller amount, causing subsequent operations to fail.
@@ -444,34 +443,8 @@ Parameters: `OP_DELEVER, withdrawAllCollateral=false`
 4. Keep remaining collateral as unleveraged sUSDD
 5. Convert any idle USDT to sUSDD collateral (done after flash loan)
 
-### Edge Case: Underwater Position (Rebalance)
+### Edge Case: Underwater Position
 
-If `currentDebt > 0 && totalAssets() == 0` (underwater: idle + collateral value ≤ debt), `rebalance()` is a true no-op:
+If underwater (`currentDebt > 0 && NAV == 0`), `rebalance()` is a true no-op — delevering is impossible without external capital.
 
-```solidity
-if (currentDebt > 0 && totalAssets() == 0) {
-    return;  // No state change, no events
-}
-```
-
-**Note:** This check only triggers when there's debt. An empty vault (no position, no idle) is NOT considered underwater and can have its targetLTV updated.
-
-> **Distinction:** Deposits use a different check (`totalSupply() > 0 && NAV == 0`) because they need to prevent division by zero when calculating shares. See ADR-003 for details.
-
-**Why this is correct:**
-
-| Scenario | Collateral | Debt | NAV | Can Delever? |
-|----------|------------|------|-----|--------------|
-| Healthy | 4000 USDT | 3000 USDT | 1000 USDT | ✅ Yes |
-| Underwater | 2900 USDT | 3000 USDT | 0 | ❌ No |
-
-Delevering requires: sell collateral → get USDT → repay debt.
-If collateral < debt, there's not enough USDT to repay — delevering is impossible without external capital.
-
-**What to do with underwater positions:**
-
-1. **Wait for liquidation** — Morpho will liquidate when position crosses LLTV
-2. **Capital injection** — Add USDT externally, then delever
-3. **Accept the loss** — Users redeem what's available
-
-This is not a bug — it's the correct behavior for an insolvent position.
+See [requirements.md](../requirements.md#underwater-behavior-for-rebalance) for full underwater behavior and recovery options.

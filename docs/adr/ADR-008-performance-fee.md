@@ -4,7 +4,7 @@
 How do we accrue and calculate performance fees?
 
 ## Decision
-**High-water mark with virtual shares** - mint fee shares on explicit harvest when NAV exceeds previous high.
+**High-water mark with virtual shares** - mint fee shares when NAV/share exceeds previous high. Fees are auto-accrued on every deposit/redeem; `claimRewards("0x")` can also trigger accrual.
 
 ## Mechanism
 

@@ -33,8 +33,8 @@ A dedicated function added ~30 lines of code with no additional safety benefit.
 
 ## Pause States
 
-| State | Deposits | Redeems | Rebalance | HarvestFees |
-|-------|----------|---------|-----------|-------------|
+| State | Deposits | Redeems | Rebalance | claimRewards |
+|-------|----------|---------|-----------|--------------|
 | Normal | ✅ | ✅ | ✅ | ✅ |
 | Paused | ❌ | ✅ | ❌ | ✅ |
 | Paused + IDLE_MODE | ❌ | ✅ (idle USDT) | ❌ | ✅ |
@@ -42,38 +42,15 @@ A dedicated function added ~30 lines of code with no additional safety benefit.
 
 > \* If underwater (debt > collateral): `redeem()` reverts during flash loan, `rebalance()` is no-op. If ZeroNAV without debt (sUSDD depeg): `redeem()` may succeed, `rebalance()` proceeds.
 
-> **Note:** `harvestFees()` is intentionally allowed when paused. This lets the manager collect accrued fees during emergencies without affecting user withdrawals.
+> **Note:** `claimRewards()` is intentionally allowed when paused. This lets the keeper collect accrued fees during emergencies without affecting user withdrawals.
 
 ## Limitations
 
-### ZeroNAV vs Underwater
+### ZeroNAV and Underwater
 
-The vault distinguishes two related conditions:
+See [requirements.md](../requirements.md#zeronav-vs-underwater) for full ZeroNAV/Underwater behavior and recovery options.
 
-| Condition | Check | Affected Operations |
-|-----------|-------|---------------------|
-| **ZeroNAV** | `totalSupply() > 0 && NAV == 0` | `deposit()` reverts |
-| **Underwater** | `currentDebt > 0 && NAV == 0` | `rebalance()` no-op, `redeem()` fails |
-
-**ZeroNAV** blocks deposits to prevent division by zero when calculating shares.
-
-**Underwater** blocks rebalance because delevering is impossible (debt > collateral value).
-
-### Underwater Position (NAV = 0, Debt > 0)
-
-If `currentDebt > 0` AND `idle + collateral value ≤ debt` (NAV = 0):
-- `rebalance(*)` is a true no-op (no state change, no events)
-- `deposit()` reverts with `ZeroNAV`
-- `redeem()` reverts during flash loan repayment (insufficient USDT)
-
-**Note:** An empty vault (no position, no shares) can still update `targetLTV`.
-
-**Why redeem reverts during flash loan:** The proportional withdrawal attempts to repay debt via flash loan. Since collateral value < debt, swapping collateral yields less USDT than needed to repay the flash loan.
-
-**Resolution options:**
-1. Wait for Morpho liquidation (clears bad debt)
-2. Inject capital externally, then delever
-3. Accept the loss
+Key impact on emergencies: if underwater, `rebalance()` is a no-op and `redeem()` reverts. Only Morpho liquidation or capital injection can recover.
 
 ### Paused State Blocks Rebalance
 

@@ -16,7 +16,7 @@ Leveraged DeFi Vault that allows users to earn amplified sUSDD yield through Mor
 - **No AMM slippage** on sUSDD/USDT conversion (uses PSM + ERC4626)
 - **Limited ERC4626** - only `deposit()` and `redeem()` supported (see ADR-005)
 - **Atomic operations** - deposits/withdrawals via flash loans (when `targetLTV > 0`)
-- **PSM fees assumed 0** - see "PSM Fee Assumption" section below
+- **PSM tout handled dynamically** - swap functions account for PSM buyGem fee; see "PSM Fee Handling" section below
 
 ---
 
@@ -77,7 +77,7 @@ The vault supports three operating modes based on `targetLTV`:
 **Leveraged Mode (`targetLTV > 0`):**
 - Deposits build **leveraged sUSDD position** (collateral + debt)
 - Earns **amplified sUSDD yield** minus borrowing costs
-- Target LTV must be below both MAX_LTV (90%) and market LLTV
+- Target LTV must be below both MAX_LTV (91.5%) and market LLTV
 
 ### 4.2 Rebalancing
 - Keeper monitors LTV and adjusts position via `rebalance(targetLTV)`
@@ -86,12 +86,12 @@ The vault supports three operating modes based on `targetLTV`:
   - `rebalance(IDLE_MODE)` → Exit to idle USDT (emergency)
   - `rebalance(0)` → Unleveraged sUSDD (when carry trade unprofitable)
   - `rebalance(newLTV)` → Adjust leverage ratio
-- LTV is validated against both MAX_LTV (90%) and market LLTV
+- LTV is validated against both MAX_LTV (91.5%) and market LLTV
 
 ### 4.3 Performance Fee
 - Vault charges performance fee on profits above high-water mark
 - Fees are **automatically accrued** on every deposit/redeem (before share mint/burn)
-- Manager can also call `harvestFees()` to accrue fees + emit heartbeat event
+- Keeper can also call `claimRewards("0x")` to accrue fees + emit heartbeat event
 - This ensures fairness: fees are always current before any share price calculation
 
 ---
@@ -100,7 +100,7 @@ The vault supports three operating modes based on `targetLTV`:
 
 | Parameter | Description | Example | Constraints |
 |-----------|-------------|---------|-------------|
-| `targetLTV` | Target leverage mode | 0.75e18 (75%) | IDLE_MODE, 0, or < MAX_LTV and < LLTV |
+| `targetLTV` | Target leverage mode | 0.75e18 (75%) | IDLE_MODE, 0, or <= MAX_LTV (91.5%) and < LLTV |
 | `performanceFeeBps` | Fee on profits (bps) | 1000 (10%) | Max 3000 (30%) |
 | `maxTotalAssets` | Vault TVL cap | 10M USDT | - |
 | `feeRecipient` | Address receiving fees | - | Non-zero |
@@ -134,7 +134,6 @@ The vault supports optional whitelist mode to restrict deposits and redemptions 
 | `setWhitelistEnabled(bool)` | Enable or disable whitelist mode |
 | `addToWhitelist(address)` | Add single address |
 | `removeFromWhitelist(address)` | Remove single address |
-| `addToWhitelistBatch(address[])` | Add multiple addresses |
 
 ### Notes
 
@@ -149,7 +148,7 @@ The vault supports optional whitelist mode to restrict deposits and redemptions 
 | Error | Trigger |
 |-------|---------|
 | `InvalidAdmin` | admin is zero address in initialize() |
-| `InvalidLTV` | targetLTV > MAX_LTV (90%) |
+| `InvalidLTV` | targetLTV > MAX_LTV (91.5%) |
 | `LTVExceedsLLTV` | targetLTV >= market liquidation threshold |
 | `InvalidFee` | performanceFeeBps > 30% |
 | `InvalidRecipient` | feeRecipient is zero address |
@@ -232,48 +231,38 @@ This is intentional: reverting on tiny deposits would harm UX, and the "unlevera
 | Liquidation | Conservative LTV, rebalance buffer, LLTV validation |
 | Keeper failure | Multiple keepers via AccessControl |
 | Morpho liquidity | Monitor utilization off-chain |
-| PSM fee changes | See "PSM Fee Assumption" below |
+| PSM fee changes | tout handled dynamically; tin reduces deposit value (captured by Delta NAV) |
 | Morpho exploit via approval | Morpho Blue is immutable (see "Approval Security" below) |
 
-### PSM Fee Assumption
+### PSM Fee Handling
 
-> **Design Decision:** The vault assumes PSM tin/tout fees are **0** (current mainnet state).
+> **Design Decision:** Swap functions handle PSM `tout` (buyGem fee) dynamically. NAV calculation assumes 1:1 peg (ignores fees).
 
-This assumption is used in:
-- `SwapHelper.sol` — all swap and preview functions
-- `SUSDDVault.sol` — NAV calculation, deposit/withdraw logic
+**tout (buyGem fee):**
+- `SwapHelper` calculates `gemAmt = usddAmount * 1e6 / (1e18 + tout)` — accounts for the fee when converting USDD → USDT
+- When `tout = 0`, this simplifies to `usddAmount / 1e12` (1:1 swap)
+- When `tout > 0`, user receives less USDT but operations succeed
 
-**Why we made this choice:**
+**tin (sellGem fee):**
+- No special handling needed — PSM takes fee from output USDD
+- Delta NAV correctly reflects the reduced deposit value (fewer sUSDD shares minted)
 
-| Factor | Consideration |
-|--------|---------------|
-| Current state | PSM tin/tout = 0 on mainnet |
-| Probability of change | Very low (USDD governance decision) |
-| Code complexity | Handling fees adds ~30% more code |
-| Gas cost | Fee calculations in every operation |
+**NAV calculation:**
+- `getUSDTValue()` uses 1:1 USDD:USDT peg (ignores tout)
+- Rationale: tout is a swap fee, not a depeg — deducting it from NAV would undervalue the vault
 
-**What happens if PSM enables fees:**
+**Preview functions:**
+- `previewDeposit()`, `previewSwapSUSDDtoUSDT()` etc. assume tin/tout = 0
+- These are estimates only; actual shares use Delta NAV
+- Integrators should not rely on preview accuracy if PSM fees change
 
-| Operation | Behavior | Risk |
-|-----------|----------|------|
-| `previewDeposit()` | Returns inaccurate estimate | Low (informational only) |
-| `deposit()` | May work (overpays slightly) | Low |
-| `withdraw()` | Reverts (insufficient USDT) | None (fail-safe) |
-| Delever | Reverts (insufficient USDT) | None (fail-safe) |
-| Funds | Safe in Morpho | None |
-
-> **Note:** Preview functions (`previewDeposit`, `convertToShares`) may become inaccurate if PSM fees are enabled, but deposits may still succeed. Integrators should not rely on preview accuracy if PSM fees change.
-
-**Resolution path:** Upgrade implementation via UUPS proxy (`upgradeTo`) with fee handling logic.
-
-**How reverts happen:** The vault code assumes 1:1 swap rates. If PSM enables fees:
-- `buyGem(gemAmt)` expects to receive `gemAmt` USDT
-- With fees, PSM sends less than `gemAmt`
-- Subsequent operations fail due to insufficient balance
-
-The vault does NOT explicitly check tin/tout values — reverts are a consequence of incorrect assumptions, not explicit guards. This is acceptable because:
-1. Reverts are fail-safe (no fund loss)
-2. Adding explicit checks would increase code complexity for a low-probability scenario
+| Operation | Behavior with tout > 0 |
+|-----------|----------------------|
+| `deposit()` | Works (Delta NAV captures actual value) |
+| `redeem()` | Works (user receives less USDT) |
+| `rebalance(IDLE_MODE)` | Works (less USDT recovered) |
+| `previewDeposit()` | Slightly inaccurate estimate |
+| `totalAssets()` | Unaffected (NAV ignores tout) |
 
 ### Approval Security
 
@@ -304,10 +293,10 @@ See [ADR-004](adr/ADR-004-atomic-leverage.md#why-unlimited-approval-is-safe-for-
 
 **USDD Dust from Decimal Conversion**
 
-When converting sUSDD → USDT, the 18→6 decimal division (`usddReceived / 1e12`) truncates up to 0.000001 USDD per swap. This dust:
+When converting USDD → USDT via PSM, the `gemAmt` calculation (`usddAmount * 1e6 / (1e18 + tout)`) may leave small USDD remainders. This dust:
 - Stays in the vault as USDD balance
 - Is NOT included in `totalAssets()` (which only counts USDT, sUSDD collateral, debt)
-- Accumulates over time but is negligible (< 1 USDD per million swaps)
+- Accumulates over time but is negligible
 - No sweep mechanism implemented (gas cost exceeds value)
 
 **TVL Limit Check**

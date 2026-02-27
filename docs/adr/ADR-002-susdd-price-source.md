@@ -4,7 +4,7 @@
 Where do we get the sUSDD price for NAV calculation?
 
 ## Decision
-**Use sUSDD ERC4626 rate** via `convertToAssets()`, assuming PSM tin/tout = 0.
+**Use sUSDD ERC4626 rate** via `convertToAssets()`. NAV assumes 1:1 USDD:USDT peg; swap functions handle tout dynamically.
 
 ## Swap Path
 
@@ -31,7 +31,7 @@ USDD Token: `0x4f8e5de400de08b164e7421b3ee387f461becd1a`
 
 **Current State:** `tin = 0` and `tout = 0` (1:1 swap).
 
-> **Assumption:** The implementation assumes tin/tout remain 0. If PSM governance enables fees, withdraw/delever operations will revert (fail-safe). See requirements.md "PSM Fee Assumption" for rationale.
+> **Note:** `SwapHelper` handles `tout` dynamically — `gemAmt = usddAmount * 1e6 / (1e18 + tout)`. When `tout = 0`, this simplifies to `usddAmount / 1e12`. NAV calculation (`getUSDTValue`) uses 1:1 peg (ignores tout). See requirements.md "PSM Fee Handling" for rationale.
 
 ### Step 2: sUSDD (USDD ↔ sUSDD)
 
@@ -51,7 +51,7 @@ sUSDD_value_in_USDT = sUSDD_amount
                     / 1e12                                 // USDD (18 dec) → USDT (6 dec)
 ```
 
-Note: No PSM fee adjustment since we assume tin/tout = 0.
+Note: NAV uses 1:1 USDD:USDT peg (tout is a swap fee, not a depeg).
 
 ## Rationale
 
@@ -59,7 +59,7 @@ Note: No PSM fee adjustment since we assume tin/tout = 0.
 
 2. **No oracle risk** - No external oracle dependency.
 
-3. **Simplicity** - Assumes 1:1 PSM, reducing code complexity.
+3. **Simplicity** - NAV assumes 1:1 PSM peg; swaps handle tout dynamically.
 
 ## Implementation
 
@@ -72,4 +72,4 @@ Note: No PSM fee adjustment since we assume tin/tout = 0.
 - `previewSwapSUSDDtoUSDT(uint256 susddAmount)` - preview swap result
 - `previewSUSDDNeededForUSDT(uint256 usdtAmount)` - inverse calculation for delever
 
-All functions assume PSM tin/tout = 0. If fees are enabled, swap functions will revert due to balance mismatches.
+Swap functions handle PSM `tout` dynamically. NAV/preview functions assume 1:1 peg (tout is a swap fee, not included in valuation).

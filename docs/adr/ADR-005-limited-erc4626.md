@@ -78,11 +78,11 @@ These are "input-specified" operations where the output can vary slightly.
 
 ```solidity
 function mint(uint256, address) public pure override returns (uint256) {
-    revert("mint() not supported, use deposit()");
+    revert NotSupported();
 }
 
 function withdraw(uint256, address, address) public pure override returns (uint256) {
-    revert("withdraw() not supported, use redeem()");
+    revert NotSupported();
 }
 
 function maxMint(address) public pure override returns (uint256) {

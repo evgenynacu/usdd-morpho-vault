@@ -77,7 +77,7 @@ totalAssets = idle USDT
             - USDT debt
 ```
 
-All values in USDT terms. Assumes 1:1 USDD:USDT peg (PSM tin/tout = 0).
+All values in USDT terms. NAV assumes 1:1 USDD:USDT peg (tout is a swap fee, not included in NAV valuation).
 
 ### Component Breakdown
 
@@ -165,7 +165,7 @@ function _estimateDepositValue(uint256 assets) internal view returns (uint256) {
 }
 ```
 
-**Why this works:** PSM is 1:1 (tin/tout = 0), so preview matches actual execution exactly.
+**Why this works:** When PSM fees are 0, preview matches actual execution exactly. If tout > 0, preview is slightly optimistic but deposits still work (Delta NAV uses actual post-swap values).
 
 ### Preview Limitations
 
@@ -176,29 +176,9 @@ function _estimateDepositValue(uint256 assets) internal view returns (uint256) {
 
 Additionally, if sUSDD rate changes between preview and deposit, actual shares may differ slightly.
 
-### Operating Modes
-
-The vault supports three modes based on `targetLTV`:
-
-| Mode | targetLTV | Deposit Behavior | Yield |
-|------|-----------|------------------|-------|
-| **IDLE_MODE** | `type(uint256).max` | Stay as idle USDT | None |
-| **Unleveraged** | `0` | Convert to sUSDD collateral | sUSDD yield |
-| **Leveraged** | `1..MAX_LTV` | Build leveraged position | Amplified yield |
-
-**IDLE_MODE (`type(uint256).max`):**
-- Deposits stay as idle USDT (no position, no flash loan)
-- Value added = deposited assets (1:1)
-- **No yield** is earned
-- Useful for emergency pause of all strategy exposure
-
-**Unleveraged Mode (`targetLTV = 0`):**
-- Deposits convert to sUSDD collateral (no borrowing)
-- Value added = sUSDD value after conversion
-- Earns **sUSDD staking yield** without leverage
-- Useful when carry trade is unprofitable but sUSDD yield is still desired
-
 ## Edge Cases
+
+> Operating modes (IDLE_MODE, unleveraged, leveraged) are defined in [requirements.md](../requirements.md#411-operating-modes).
 
 | Case | Handling |
 |------|----------|
@@ -206,35 +186,8 @@ The vault supports three modes based on `targetLTV`:
 | ZeroNAV (NAV = 0, supply > 0) | `previewDeposit` returns 0, `deposit` reverts with `ZeroNAV` |
 | Dust deposit (shares round to 0) | Reverts with `DepositTooSmall` (protects existing holders) |
 
-### ZeroNAV vs Underwater
+### ZeroNAV and Underwater
 
-The vault uses different checks for different operations:
+See [requirements.md](../requirements.md#zeronav-vs-underwater) for full ZeroNAV/Underwater behavior.
 
-| Condition | Check | Used By |
-|-----------|-------|---------|
-| **ZeroNAV** | `totalSupply() > 0 && NAV == 0` | `deposit()`, `maxDeposit()` |
-| **Underwater** | `currentDebt > 0 && NAV == 0` | `rebalance()` |
-
-**Why different?**
-- **Deposits** must prevent division by zero: `shares = value * supply / NAV`
-- **Rebalance** only needs to skip when delevering is impossible (debt exists but no value)
-
-### ZeroNAV Behavior (Deposits)
-
-When `totalAssets() == 0` and `totalSupply() > 0`:
-- `previewDeposit()` returns 0 (signals deposits blocked)
-- `deposit()` reverts with `ZeroNAV`
-
-This protects against division by zero and infinite share minting.
-
-### Underwater Behavior (Rebalance)
-
-When `currentDebt > 0` and `totalAssets() == 0`:
-- `rebalance()` is a true no-op (returns early, no state change, no events)
-- `redeem()` reverts during flash loan (insufficient USDT to repay)
-
-**Note:** An empty vault (no position, no shares) can still update `targetLTV`.
-
-**Why redeem reverts during flash loan:** The proportional withdrawal attempts to repay debt via flash loan. With insufficient collateral value to cover debt, the flash loan repayment fails.
-
-**Recovery path:** Wait for Morpho liquidation or external capital injection to restore positive NAV.
+**Relevance to share calculation:** Deposits check `totalSupply() > 0 && NAV == 0` because `shares = value * supply / NAV` would divide by zero.
