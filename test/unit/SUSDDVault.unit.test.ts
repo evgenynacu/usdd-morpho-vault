@@ -858,6 +858,56 @@ describe("SUSDDVault Unit Tests", function () {
       expect(feeRecipientSharesAfter).to.be.gt(feeRecipientSharesBefore);
     });
 
+    it("should set highWaterMark to post-fee PPS, not pre-fee PPS", async function () {
+      // Setup: IDLE_MODE so NAV = USDT balance (simplest case)
+      await vault.connect(manager).addToWhitelist(user1.address);
+      await vault.connect(keeper).rebalance(ethers.MaxUint256);
+
+      const depositAmount = ethers.parseUnits("10000", 6);
+      await vault.connect(user1).deposit(depositAmount, user1.address);
+
+      // Simulate 10% profit
+      await usdt.mint(await vault.getAddress(), ethers.parseUnits("1000", 6));
+
+      // Trigger fee accrual
+      await vault.connect(admin).claimRewards("0x");
+
+      const hwm = await vault.highWaterMark();
+      const nav = await vault.totalAssets();
+      const supply = await vault.totalSupply();
+      const postFeePPS = (nav * WAD) / supply;
+
+      // HWM should equal post-fee PPS (actual PPS after dilution)
+      // Bug: HWM = pre-fee PPS (1.1e18) which is higher than actual PPS (≈1.09e18)
+      expect(hwm).to.equal(postFeePPS);
+    });
+
+    it("should charge fee on yield in dead zone between post-fee and pre-fee PPS", async function () {
+      // Setup: IDLE_MODE
+      await vault.connect(manager).addToWhitelist(user1.address);
+      await vault.connect(keeper).rebalance(ethers.MaxUint256);
+
+      const depositAmount = ethers.parseUnits("10000", 6);
+      await vault.connect(user1).deposit(depositAmount, user1.address);
+
+      // Yield #1: +10% — triggers fee accrual
+      await usdt.mint(await vault.getAddress(), ethers.parseUnits("1000", 6));
+      await vault.connect(admin).claimRewards("0x");
+
+      const feeSharesAfterFirst = await vault.balanceOf(admin.address);
+
+      // Yield #2: small yield (+50 USDT) — brings PPS above post-fee PPS
+      // but below buggy pre-fee HWM. This is REAL profit that should be taxed.
+      await usdt.mint(await vault.getAddress(), ethers.parseUnits("50", 6));
+      await vault.connect(admin).claimRewards("0x");
+
+      const feeSharesAfterSecond = await vault.balanceOf(admin.address);
+
+      // With fix: fee charged on this yield → more fee shares
+      // With bug: PPS still below (buggy) HWM → NO fee → assertion fails
+      expect(feeSharesAfterSecond).to.be.gt(feeSharesAfterFirst);
+    });
+
     it("should not harvest when performanceFeeBps is 0", async function () {
       await vault.connect(admin).setPerformanceFee(0);
 

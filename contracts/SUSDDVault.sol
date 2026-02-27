@@ -872,7 +872,7 @@ contract SUSDDVault is
         if (feeShares > 0) {
             _mint(feeRecipient, feeShares);
             supply += feeShares;
-            highWaterMark = currentPPS;
+            highWaterMark = (nav * 1e18) / supply;
             emit PerformanceFeeAccrued(feeShares, feeRecipient);
         }
 
