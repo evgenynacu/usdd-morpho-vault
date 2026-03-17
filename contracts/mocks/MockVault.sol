@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 /// @title MockVault
 /// @notice Mock implementation of IVault for testing EmergencyKeeper
 contract MockVault {
+    uint256 public targetLTV;
     uint256 public lastRebalanceLTV;
     bool public paused;
     uint256 public rebalanceCallCount;
@@ -34,5 +35,9 @@ contract MockVault {
 
     function setRevertOnPause(bool _shouldRevert) external {
         shouldRevertOnPause = _shouldRevert;
+    }
+
+    function setTargetLTV(uint256 _targetLTV) external {
+        targetLTV = _targetLTV;
     }
 }
