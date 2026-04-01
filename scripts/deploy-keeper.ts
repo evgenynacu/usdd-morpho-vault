@@ -6,22 +6,30 @@
 //
 //   # Deploy and configure vaults
 //   VAULTS=0x123...,0x456... npx hardhat run scripts/deploy-keeper.ts --network mainnet
+//
+//   # Skip deploy, use existing keeper
+//   KEEPER_ADDRESS=0x789... VAULTS=0x123...,0x456... npx hardhat run scripts/deploy-keeper.ts --network mainnet
 
 import { ethers } from "hardhat";
 
 async function main() {
   const [deployer] = await ethers.getSigners();
-  console.log("Deploying EmergencyKeeper with account:", deployer.address);
-  console.log("Account balance:", ethers.formatEther(await ethers.provider.getBalance(deployer.address)), "ETH");
+  console.log("Account:", deployer.address);
+  console.log("Balance:", ethers.formatEther(await ethers.provider.getBalance(deployer.address)), "ETH");
 
-  // Deploy EmergencyKeeper
-  console.log("\nDeploying EmergencyKeeper...");
   const KeeperFactory = await ethers.getContractFactory("EmergencyKeeper");
-  const keeper = await KeeperFactory.deploy(deployer.address);
-  await keeper.waitForDeployment();
-  const keeperAddress = await keeper.getAddress();
-  console.log("EmergencyKeeper deployed:", keeperAddress);
-  console.log("  Owner:", await keeper.owner());
+  let keeperAddress: string;
+
+  if (process.env.KEEPER_ADDRESS) {
+    keeperAddress = process.env.KEEPER_ADDRESS;
+    console.log("\nUsing existing EmergencyKeeper:", keeperAddress);
+  } else {
+    console.log("\nDeploying EmergencyKeeper...");
+    const keeper = await KeeperFactory.deploy(deployer.address);
+    await keeper.waitForDeployment();
+    keeperAddress = await keeper.getAddress();
+    console.log("EmergencyKeeper deployed:", keeperAddress);
+  }
 
   // Configure vault roles if VAULTS env var is provided
   const vaultsEnv = process.env.VAULTS;
@@ -52,20 +60,27 @@ async function main() {
       const KEEPER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
       const PAUSER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("PAUSER_ROLE"));
 
-      const grantKeeperTx = await vault.grantRole(KEEPER_ROLE, keeperAddress);
-      await grantKeeperTx.wait();
-      console.log("    KEEPER_ROLE granted:", await vault.hasRole(KEEPER_ROLE, keeperAddress));
+      if (await vault.hasRole(KEEPER_ROLE, keeperAddress)) {
+        console.log("    KEEPER_ROLE already granted, skipping");
+      } else {
+        const grantKeeperTx = await vault.grantRole(KEEPER_ROLE, keeperAddress);
+        await grantKeeperTx.wait();
+        console.log("    KEEPER_ROLE granted:", await vault.hasRole(KEEPER_ROLE, keeperAddress));
+      }
 
-      const grantPauserTx = await vault.grantRole(PAUSER_ROLE, keeperAddress);
-      await grantPauserTx.wait();
-      console.log("    PAUSER_ROLE granted:", await vault.hasRole(PAUSER_ROLE, keeperAddress));
+      if (await vault.hasRole(PAUSER_ROLE, keeperAddress)) {
+        console.log("    PAUSER_ROLE already granted, skipping");
+      } else {
+        const grantPauserTx = await vault.grantRole(PAUSER_ROLE, keeperAddress);
+        await grantPauserTx.wait();
+        console.log("    PAUSER_ROLE granted:", await vault.hasRole(PAUSER_ROLE, keeperAddress));
+      }
     }
   }
 
   // Summary
   console.log("\n=== Deployment Summary ===");
   console.log("EmergencyKeeper:", keeperAddress);
-  console.log("Owner:", deployer.address);
   if (vaultAddresses.length > 0) {
     console.log("Configured vaults:", vaultAddresses.length);
     for (const vaultAddr of vaultAddresses) {
@@ -75,7 +90,7 @@ async function main() {
     console.log("No vaults configured (set VAULTS env var to configure)");
   }
 
-  return { keeper, keeperAddress };
+  return { keeperAddress };
 }
 
 main()

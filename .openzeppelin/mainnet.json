@@ -10,6 +10,11 @@
       "address": "0x2387053F7Aee257F33a35708EbC7ca71AE07B584",
       "txHash": "0x03a4b39517c63279c5703fd5ba8c92b7bcde7461c2157c822d7ef47096bb4ecf",
       "kind": "uups"
+    },
+    {
+      "address": "0x4A6543939443E6cb7CFAbA9A1D853697e9c4f11d",
+      "txHash": "0xacdd60431b27dab0479aac3b70b1c66c0f6dd2b1be8daaa0f204d8307de85668",
+      "kind": "uups"
     }
   ],
   "impls": {
@@ -2070,7 +2075,11 @@
             }
           ]
         }
-      }
+      },
+      "allAddresses": [
+        "0x8aB7513EfBA974073248e961468abc42F010D5CE",
+        "0x8ab7513efba974073248e961468abc42f010d5ce"
+      ]
     }
   }
 }

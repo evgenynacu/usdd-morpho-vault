@@ -7,6 +7,8 @@ async function main() {
 
   // Configuration - override with env vars:
   // LTV=0.9 FEE=1000 CAP=500000 WHITELIST=false npx hardhat run scripts/deploy.ts --network mainnet
+  // To reuse existing implementation:
+  // IMPLEMENTATION=0x... npx hardhat run scripts/deploy.ts --network mainnet
   const config = {
     admin: process.env.ADMIN || deployer.address,
     feeRecipient: process.env.FEE_RECIPIENT || deployer.address,
@@ -23,9 +25,17 @@ async function main() {
   console.log("  Performance Fee:", Number(config.performanceFeeBps) / 100 + "%");
   console.log("  Max Total Assets:", ethers.formatUnits(config.maxTotalAssets, 6), "USDT");
 
-  console.log("\nDeploying SUSDDVault via UUPS proxy...");
-
   const VaultFactory = await ethers.getContractFactory("SUSDDVault");
+  const implementationAddress = process.env.IMPLEMENTATION;
+
+  if (implementationAddress) {
+    console.log("\nReusing existing implementation:", implementationAddress);
+    await upgrades.forceImport(implementationAddress, VaultFactory, { kind: "uups" });
+    console.log("  Implementation registered in manifest");
+  }
+
+  console.log("\nDeploying SUSDDVault proxy...");
+
   const vault = await upgrades.deployProxy(
     VaultFactory,
     [
@@ -35,16 +45,19 @@ async function main() {
       config.performanceFeeBps,
       config.maxTotalAssets
     ],
-    { kind: "uups" }
+    {
+      kind: "uups",
+      ...(implementationAddress && { useDeployedImplementation: true }),
+    }
   );
 
   await vault.waitForDeployment();
   const proxyAddress = await vault.getAddress();
-  const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
+  const finalImplementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
 
   console.log("\nSUSDDVault deployed:");
   console.log("  Proxy address:", proxyAddress);
-  console.log("  Implementation address:", implementationAddress);
+  console.log("  Implementation address:", finalImplementationAddress);
 
   // Verify deployment
   console.log("\nVerifying deployment...");
@@ -81,10 +94,10 @@ async function main() {
 
   console.log("\n=== Deployment Complete ===");
   console.log("Proxy Address:", proxyAddress);
-  console.log("Implementation Address:", implementationAddress);
+  console.log("Implementation Address:", finalImplementationAddress);
 
   // Return for testing
-  return { vault, proxyAddress, implementationAddress };
+  return { vault, proxyAddress, implementationAddress: finalImplementationAddress };
 }
 
 main()
